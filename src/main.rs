@@ -92,10 +92,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("running… press Ctrl-C or send SIGTERM to stop");
 
+    // Wrap clients in Arc for sharing across tasks
+    let stt = std::sync::Arc::new(stt);
+    let tts = std::sync::Arc::new(tts);
+
     // Task: capture audio → downsample → send to STT
-    let stt_ref = &stt;
-    let mut audio_chunks_sent = 0u64;
-    let capture_task = async {
+    let stt_clone = std::sync::Arc::clone(&stt);
+    let capture_task = tokio::spawn(async move {
+        let mut audio_chunks_sent = 0u64;
         while let Some(pcm_48k) = capture_rx.recv().await {
             // Downsample 48kHz → 24kHz
             let pcm_24k = downsampler::downsample_48_to_24(&pcm_48k);
@@ -114,15 +118,15 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Send to STT
-            if let Err(e) = stt_ref.process(&b64).await {
+            if let Err(e) = stt_clone.process(&b64).await {
                 warn!("STT process error: {e}");
             }
         }
-    };
+    });
 
     // Task: handle STT events → send text to TTS
-    let tts_ref = &tts;
-    let stt_event_task = async {
+    let tts_clone = std::sync::Arc::clone(&tts);
+    let stt_event_task = tokio::spawn(async move {
         let mut pending_text = String::new();
         while let Some(event) = stt_events.recv().await {
             match event {
@@ -131,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
                     // Send accumulated text to TTS when user stops speaking
                     if !pending_text.trim().is_empty() {
                         info!("Sending to TTS: '{}'", pending_text.trim());
-                        if let Err(e) = tts_ref.process(pending_text.trim()).await {
+                        if let Err(e) = tts_clone.process(pending_text.trim()).await {
                             warn!("TTS process error: {e}");
                         }
                         pending_text.clear();
@@ -157,14 +161,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 SttEvent::EndOfStream => {
                     info!("STT end of stream");
+                    break;
                 }
             }
         }
-    };
+    });
 
     // Task: handle TTS events → decode audio → send to playback
-    let playback_tx_ref = &playback_tx;
-    let tts_event_task = async {
+    let tts_event_task = tokio::spawn(async move {
         while let Some(event) = tts_events.recv().await {
             match event {
                 TtsEvent::Audio { audio } => {
@@ -176,7 +180,8 @@ async fn main() -> anyhow::Result<()> {
                                 .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                                 .collect();
 
-                            if let Err(e) = playback_tx_ref.send(samples) {
+                            info!("TTS audio: {} samples", samples.len());
+                            if let Err(e) = playback_tx.send(samples) {
                                 warn!("playback send error: {e}");
                             }
                         }
@@ -196,38 +201,37 @@ async fn main() -> anyhow::Result<()> {
                 }
                 TtsEvent::EndOfStream => {
                     info!("TTS end of stream");
+                    break;
                 }
             }
         }
-    };
+    });
 
-    // Signal handlers
+    // Wait for shutdown signal
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
-    let shutdown_signal = async {
-        tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down");
-            }
-            _ = sigint.recv() => {
-                info!("received SIGINT (Ctrl-C), shutting down");
-            }
-        }
-    };
-
-    // Run all tasks until shutdown signal
     tokio::select! {
-        _ = capture_task => {}
-        _ = stt_event_task => {}
-        _ = tts_event_task => {}
-        _ = shutdown_signal => {}
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, shutting down");
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT (Ctrl-C), shutting down");
+        }
     }
 
-    // Cleanup
+    // Graceful shutdown - tasks will stop when clients are shut down
     info!("shutting down STT and TTS");
     stt.shutdown().await;
     tts.shutdown().await;
 
+    // Wait for event tasks to finish (they exit on EndOfStream)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stt_event_task).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tts_event_task).await;
+
+    // Abort capture task (it won't receive EndOfStream)
+    capture_task.abort();
+
+    info!("shutdown complete");
     Ok(())
 }
