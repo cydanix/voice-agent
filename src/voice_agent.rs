@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Mutex;
 use tracing::{info, error, debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
@@ -343,9 +344,11 @@ impl VoiceAgent {
                         match event {
                             SttEvent::Step { vad, .. } => {
                                 if vad.len() > 2 && vad[2].inactivity_prob > 0.5 {
-                                    debug!("user inactive (prob: {:.2})", vad[2].inactivity_prob);
+                                    let inactivity_prob = vad[2].inactivity_prob;
 
-                                    if !pending_text.trim().is_empty() {
+                                    info!("user inactive (prob: {:.2})", inactivity_prob);
+
+                                    if !pending_text.trim().is_empty() && inactivity_prob > 0.99 {
                                         let user_input = pending_text.trim().to_string();
                                         pending_text.clear();
 
@@ -434,7 +437,7 @@ impl VoiceAgent {
                                 while let Some(chunk) = stream.next().await {
                                     match chunk {
                                         LlmChunk::Delta(text) => {
-                                            info!("LLM delta: '{}'", text);
+                                            debug!("LLM delta: '{}'", text);
                                             full_response.push_str(&text);
                                             sentence_buffer.push_str(&text);
 
