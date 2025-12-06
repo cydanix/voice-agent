@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use futures_util::StreamExt;
 use rust_gradium::{
     downsample_48_to_24, SttConfig, SttEvent, TtsConfig, TtsEvent,
     STT_ENDPOINT, TTS_ENDPOINT, DEFAULT_VOICE_ID,
@@ -11,6 +12,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, error, debug, warn};
 
+use crate::llm::{LlmClient, LlmConfig, LlmChunk};
 use crate::pcm_capture::PcmCapture;
 use crate::pcm_playback::PcmPlayback;
 use crate::stt_handle::SttHandle;
@@ -20,6 +22,7 @@ pub struct VoiceAgent {
     api_key: String,
     stt: Option<Arc<SttHandle>>,
     tts: Option<Arc<TtsHandle>>,
+    llm: Option<Arc<LlmClient>>,
     capture: Option<PcmCapture>,
     playback: Option<PcmPlayback>,
     wg: WaitGroup,
@@ -32,6 +35,7 @@ impl VoiceAgent {
             api_key,
             stt: None,
             tts: None,
+            llm: None,
             capture: None,
             playback: None,
             wg: WaitGroup::new(),
@@ -72,6 +76,21 @@ impl VoiceAgent {
         }
         info!("TTS connected");
 
+        // Create LLM client
+        let llm_api_key = std::env::var("OPENAI_API_KEY")
+            .or_else(|_| std::env::var("LLM_API_KEY"))
+            .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY or LLM_API_KEY environment variable not set"))?;
+        let llm_model = std::env::var("OPENAI_MODEL")
+            .or_else(|_| std::env::var("LLM_MODEL"))
+            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let llm_endpoint = std::env::var("LLM_ENDPOINT")
+            .unwrap_or_else(|_| crate::llm::endpoints::OPENAI.to_string());
+
+        let llm_config = LlmConfig::new(llm_endpoint, llm_api_key, llm_model)
+            .with_system_prompt("You are a helpful voice assistant. Keep your responses concise and conversational.");
+        let llm = Arc::new(LlmClient::new(llm_config));
+        info!("LLM client created");
+
         // Create audio capture
         let capture = match PcmCapture::new(capture_tx) {
             Ok(c) => c,
@@ -110,17 +129,22 @@ impl VoiceAgent {
             return Err(e);
         }
 
+        // Create channel for user input to LLM
+        let (llm_input_tx, llm_input_rx) = unbounded_channel::<String>();
+
         // Spawn background tasks
         self.spawn_stt_ping_task(Arc::clone(&stt));
         self.spawn_tts_ping_task(Arc::clone(&tts));
         self.spawn_capture_task(stt_bytes_tx, capture_rx);
         self.spawn_stt_sender_task(Arc::clone(&stt), stt_bytes_rx);
-        self.spawn_stt_event_task(Arc::clone(&stt), Arc::clone(&tts));
+        self.spawn_stt_event_task(Arc::clone(&stt), llm_input_tx);
+        self.spawn_llm_task(Arc::clone(&llm), Arc::clone(&tts), llm_input_rx);
         self.spawn_tts_event_task(Arc::clone(&tts), playback_tx);
 
         // Store handles
         self.stt = Some(stt);
         self.tts = Some(tts);
+        self.llm = Some(llm);
         self.capture = Some(capture);
         self.playback = Some(playback);
 
@@ -307,7 +331,7 @@ impl VoiceAgent {
         });
     }
 
-    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, tts: Arc<TtsHandle>) {
+    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, llm_input_tx: UnboundedSender<String>) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
@@ -322,16 +346,15 @@ impl VoiceAgent {
                                     debug!("user inactive (prob: {:.2})", vad[2].inactivity_prob);
 
                                     if !pending_text.trim().is_empty() {
-                                        info!("Sending to TTS: '{}'", pending_text.trim());
-                                        if let Err(e) = tts.process(pending_text.trim()).await {
-                                            warn!("TTS process error: {e}");
-                                        } else {
-                                            info!("Sending EOS to TTS");
-                                            if let Err(e) = tts.send_eos().await {
-                                                warn!("TTS send eos error: {e}");
-                                            }
-                                        }
+                                        let user_input = pending_text.trim().to_string();
                                         pending_text.clear();
+
+                                        info!("User said: '{}'", user_input);
+
+                                        // Send to LLM task
+                                        if let Err(e) = llm_input_tx.send(user_input) {
+                                            warn!("Failed to send to LLM task: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -380,6 +403,87 @@ impl VoiceAgent {
                     }
                     Err(e) => {
                         error!("STT event error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn spawn_llm_task(
+        &self,
+        llm: Arc<LlmClient>,
+        tts: Arc<TtsHandle>,
+        mut llm_input_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let wg_guard = self.wg.add();
+        tokio::spawn(async move {
+            let _wg_guard = wg_guard;
+            loop {
+                match llm_input_rx.recv().await {
+                    Some(user_input) => {
+                        info!("LLM processing: '{}'", user_input);
+
+                        // Reset cancellation and start streaming
+                        llm.reset_cancel();
+                        match llm.chat_stream(&user_input).await {
+                            Ok(mut stream) => {
+                                let mut full_response = String::new();
+                                let mut sentence_buffer = String::new();
+
+                                while let Some(chunk) = stream.next().await {
+                                    match chunk {
+                                        LlmChunk::Delta(text) => {
+                                            info!("LLM delta: '{}'", text);
+                                            full_response.push_str(&text);
+                                            sentence_buffer.push_str(&text);
+
+                                            // Send complete sentences to TTS for faster response
+                                            if let Some(pos) = sentence_buffer.rfind(['.', '!', '?', '\n']) {
+                                                let to_send = &sentence_buffer[..=pos];
+                                                if !to_send.trim().is_empty() {
+                                                    info!("Sending to TTS: '{}'", to_send.trim());
+                                                    if let Err(e) = tts.process(to_send.trim()).await {
+                                                        warn!("TTS process error: {e}");
+                                                    }
+                                                }
+                                                sentence_buffer = sentence_buffer[pos + 1..].to_string();
+                                            }
+                                        }
+                                        LlmChunk::Done => {
+                                            info!("LLM response complete, sending EOS to TTS");
+                                            // Send any remaining text
+                                            if !sentence_buffer.trim().is_empty() {
+                                                info!("Sending remaining to TTS: '{}'", sentence_buffer.trim());
+                                                if let Err(e) = tts.process(sentence_buffer.trim()).await {
+                                                    warn!("TTS process error: {e}");
+                                                }
+                                            }
+                                            // Send EOS to TTS
+                                            info!("LLM response complete, sending EOS to TTS");
+                                            if let Err(e) = tts.send_eos().await {
+                                                warn!("TTS send eos error: {e}");
+                                            }
+                                            info!("LLM response: '{}'", full_response);
+                                            break;
+                                        }
+                                        LlmChunk::Cancelled => {
+                                            info!("LLM stream cancelled");
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // Add assistant response to history
+                                llm.add_assistant_response(&full_response).await;
+                            }
+                            Err(e) => {
+                                error!("LLM chat error: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        info!("LLM task stopping (channel closed)");
                         break;
                     }
                 }

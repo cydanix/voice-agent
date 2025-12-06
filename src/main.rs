@@ -1,3 +1,4 @@
+mod llm;
 mod pcm_capture;
 mod pcm_playback;
 mod stt_handle;
