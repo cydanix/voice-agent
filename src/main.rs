@@ -4,7 +4,7 @@ mod stt_handle;
 mod tts_handle;
 mod voice_agent;
 
-use tracing::debug;
+use tracing::{debug, error, info};
 use voice_agent::VoiceAgent;
 
 #[tokio::main]
@@ -22,9 +22,22 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("GRADIUM_API_KEY environment variable not set"))?;
 
     let mut agent = VoiceAgent::new(api_key);
-    agent.start().await?;
-    agent.run().await?;
-    agent.shutdown().await;
+    if let Err(e) = agent.start().await {
+        error!("error starting voice agent: {e}");
+        return Err(e);
+    }
+    info!("voice agent started");
+
+    match agent.run().await {
+        Ok(_) => {
+            info!("run completed successfully");
+            agent.shutdown().await;
+        }
+        Err(e) => {
+            error!("error running voice agent: {e}");
+            agent.shutdown().await;
+        }
+    }
 
     Ok(())
 }

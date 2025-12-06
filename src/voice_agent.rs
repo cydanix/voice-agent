@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rust_gradium::{
-    downsample_48_to_24_base64, SttConfig, SttEvent, TtsConfig, TtsEvent,
+    downsample_48_to_24, SttConfig, SttEvent, TtsConfig, TtsEvent,
     STT_ENDPOINT, TTS_ENDPOINT, DEFAULT_VOICE_ID,
 };
 use rust_gradium::wg::WaitGroup;
@@ -43,6 +43,7 @@ impl VoiceAgent {
         // Create channels
         let (capture_tx, capture_rx) = unbounded_channel::<Vec<i16>>();
         let (playback_tx, playback_rx) = unbounded_channel::<Vec<i16>>();
+        let (stt_bytes_tx, stt_bytes_rx) = unbounded_channel::<Vec<u8>>();
 
         // Create STT handle
         let stt_config = SttConfig::new(STT_ENDPOINT.to_string(), self.api_key.clone());
@@ -76,8 +77,8 @@ impl VoiceAgent {
             Ok(c) => c,
             Err(e) => {
                 error!("failed to create PcmCapture: {e}");
-                stt.shutdown().await;
                 tts.shutdown().await;
+                stt.shutdown().await;
                 return Err(e);
             }
         };
@@ -87,8 +88,8 @@ impl VoiceAgent {
             Ok(p) => p,
             Err(e) => {
                 error!("failed to create PcmPlayback: {e}");
-                stt.shutdown().await;
                 tts.shutdown().await;
+                stt.shutdown().await;
                 return Err(e);
             }
         };
@@ -96,22 +97,24 @@ impl VoiceAgent {
         // Start audio streams
         if let Err(e) = capture.start() {
             error!("failed to start capture: {e}");
-            stt.shutdown().await;
             tts.shutdown().await;
+            stt.shutdown().await;
             return Err(e);
         }
 
         if let Err(e) = playback.start() {
             error!("failed to start playback: {e}");
-            stt.shutdown().await;
+            capture.stop();
             tts.shutdown().await;
+            stt.shutdown().await;
             return Err(e);
         }
 
         // Spawn background tasks
         self.spawn_stt_ping_task(Arc::clone(&stt));
         self.spawn_tts_ping_task(Arc::clone(&tts));
-        self.spawn_capture_task(Arc::clone(&stt), capture_rx);
+        self.spawn_capture_task(stt_bytes_tx, capture_rx);
+        self.spawn_stt_sender_task(Arc::clone(&stt), stt_bytes_rx);
         self.spawn_stt_event_task(Arc::clone(&stt), Arc::clone(&tts));
         self.spawn_tts_event_task(Arc::clone(&tts), playback_tx);
 
@@ -161,6 +164,7 @@ impl VoiceAgent {
         // Shutdown TTS
         if let Some(ref tts) = self.tts {
             info!("shutting down TTS");
+            tts.set_final_shutdown();
             tts.shutdown().await;
         }
 
@@ -215,7 +219,7 @@ impl VoiceAgent {
 
     fn spawn_capture_task(
         &self,
-        stt: Arc<SttHandle>,
+        stt_bytes_tx: UnboundedSender<Vec<u8>>,
         mut capture_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
     ) {
         let wg_guard = self.wg.add();
@@ -225,25 +229,71 @@ impl VoiceAgent {
             loop {
                 debug!("capture task loop");
                 if let Some(pcm_48k) = capture_rx.recv().await {
-                    // Convert to bytes (little-endian i16)
-                    let bytes: Vec<u8> = pcm_48k.iter().flat_map(|s| s.to_le_bytes()).collect();
-                    let b64_48k = BASE64.encode(&bytes);
-
-                    // Downsample 48kHz → 24kHz
-                    let b64_24k = downsample_48_to_24_base64(&b64_48k);
-
                     // Log periodically
                     audio_chunks_sent += 1;
                     if audio_chunks_sent % 100 == 1 {
                         debug!("audio capture: chunk #{}, {} samples", audio_chunks_sent, pcm_48k.len());
                     }
 
-                    // Send to STT
-                    if let Err(e) = stt.process(&b64_24k).await {
-                        warn!("STT process error: {e}");
+                    // Convert to bytes (little-endian i16)
+                    let bytes: Vec<u8> = pcm_48k.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let bytes_24k = downsample_48_to_24(&bytes);
+
+                    // Send to STT bytes queue
+                    if let Err(e) = stt_bytes_tx.send(bytes_24k) {
+                        warn!("STT bytes queue send error: {e}");
+                        break;
                     }
                 } else {
                     info!("capture task stopping");
+                    break;
+                }
+            }
+        });
+    }
+
+    /// 80ms of 24kHz mono PCM = 1920 samples = 3840 bytes
+    const STT_CHUNK_BYTES: usize = 3840;
+
+    fn spawn_stt_sender_task(
+        &self,
+        stt: Arc<SttHandle>,
+        mut stt_bytes_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let wg_guard = self.wg.add();
+        tokio::spawn(async move {
+            let _wg_guard = wg_guard;
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut chunks_sent = 0u64;
+
+            loop {
+                if let Some(bytes) = stt_bytes_rx.recv().await {
+                    buffer.extend(bytes);
+
+                    // Send complete 80ms chunks to STT
+                    while buffer.len() >= Self::STT_CHUNK_BYTES {
+                        let chunk: Vec<u8> = buffer.drain(..Self::STT_CHUNK_BYTES).collect();
+                        let b64 = BASE64.encode(&chunk);
+
+                        chunks_sent += 1;
+                        if chunks_sent % 100 == 1 {
+                            debug!("STT sender: chunk #{}, {} bytes", chunks_sent, chunk.len());
+                        }
+
+                        if let Err(e) = stt.process(&b64).await {
+                            warn!("STT process error: {e}");
+                        }
+                    }
+                } else {
+                    // Channel closed, flush remaining buffer
+                    if !buffer.is_empty() {
+                        debug!("STT sender: flushing {} remaining bytes", buffer.len());
+                        let b64 = BASE64.encode(&buffer);
+                        if let Err(e) = stt.process(&b64).await {
+                            warn!("STT process error on flush: {e}");
+                        }
+                    }
+                    info!("STT sender task stopping");
                     break;
                 }
             }
@@ -263,10 +313,16 @@ impl VoiceAgent {
                             SttEvent::Step { vad, .. } => {
                                 if vad.len() > 2 && vad[2].inactivity_prob > 0.5 {
                                     debug!("user inactive (prob: {:.2})", vad[2].inactivity_prob);
+
                                     if !pending_text.trim().is_empty() {
                                         info!("Sending to TTS: '{}'", pending_text.trim());
                                         if let Err(e) = tts.process(pending_text.trim()).await {
                                             warn!("TTS process error: {e}");
+                                        } else {
+                                            info!("Sending EOS to TTS");
+                                            if let Err(e) = tts.send_eos().await {
+                                                warn!("TTS send eos error: {e}");
+                                            }
                                         }
                                         pending_text.clear();
                                     }
@@ -358,7 +414,15 @@ impl VoiceAgent {
                             }
                             TtsEvent::EndOfStream => {
                                 info!("TTS end of stream");
-                                break;
+                                if tts.is_final_shutdown() {
+                                    info!("TTS final shutdown");
+                                    break;
+                                }
+
+                                if let Err(e) = tts.reconnect().await {
+                                    error!("TTS reconnect error: {e}");
+                                    break;
+                                }
                             }
                             TtsEvent::Ping => {
                                 debug!("TTS ping");

@@ -1,5 +1,5 @@
 use rust_gradium::{TtsClient, TtsConfig, TtsEvent};
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -15,6 +15,7 @@ pub struct TtsHandle {
     client: Arc<RwLock<Option<TtsClient>>>,
     config: TtsConfig,
     last_ping: Arc<RwLock<Instant>>,
+    final_shutdown: AtomicBool,
 }
 
 impl TtsHandle {
@@ -23,6 +24,7 @@ impl TtsHandle {
             client: Arc::new(RwLock::new(None)),
             config,
             last_ping: Arc::new(RwLock::new(Instant::now())),
+            final_shutdown: AtomicBool::new(false),
         }
     }
 
@@ -90,6 +92,15 @@ impl TtsHandle {
             let _ = client.send_eos().await;
             client.shutdown().await;
         }
+    }
+
+    pub fn set_final_shutdown(&self) {
+        info!("TTS: setting final shutdown");
+        self.final_shutdown.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_final_shutdown(&self) -> bool {
+        self.final_shutdown.load(Ordering::SeqCst)
     }
 
     #[allow(dead_code)]
