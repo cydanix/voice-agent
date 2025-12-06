@@ -6,7 +6,10 @@ use rust_gradium::{
     downsample_48_to_24_base64, SttClient, SttConfig, SttEvent, TtsClient, TtsConfig, TtsEvent,
     STT_ENDPOINT, TTS_ENDPOINT, DEFAULT_VOICE_ID,
 };
+use rust_gradium::wg::WaitGroup;
+
 use std::sync::Arc;
+
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::RwLock;
@@ -14,12 +17,19 @@ use tokio::signal::unix::{signal, SignalKind};
 use pcm_capture::PcmCapture;
 use pcm_playback::PcmPlayback;
 use tracing::{info, error, debug, warn};
+use thiserror::Error;
 
 /// Wrapper for STT client with reconnection support
 struct SttHandle {
     client: Arc<RwLock<Option<SttClient>>>,
     config: SttConfig,
     last_ping: Arc<RwLock<Instant>>,
+}
+
+#[derive(Error, Debug)]
+enum SttHandleError {
+    #[error("STT client not connected")]
+    NotConnected,
 }
 
 impl SttHandle {
@@ -51,8 +61,10 @@ impl SttHandle {
     async fn process(&self, audio: &str) -> anyhow::Result<()> {
         if let Some(ref client) = *self.client.read().await {
             client.process(audio).await?;
+            Ok(())
+        } else {
+            Err(SttHandleError::NotConnected.into())
         }
-        Ok(())
     }
 
     async fn next_event(&self) -> anyhow::Result<Option<SttEvent>> {
@@ -66,7 +78,25 @@ impl SttHandle {
                 Err(e) => Err(e.into()),
             }
         } else {
-            Ok(None)
+            Err(SttHandleError::NotConnected.into())
+        }
+    }
+
+    async fn send_eos(&self) -> anyhow::Result<()> {
+        if let Some(ref client) = *self.client.read().await {
+            client.send_eos().await?;
+            Ok(())
+        } else {
+            Err(SttHandleError::NotConnected.into())
+        }
+    }
+
+    async fn send_ping(&self) -> anyhow::Result<()> {
+        if let Some(ref client) = *self.client.read().await {
+            client.send_ping().await?;
+            Ok(())
+        } else {
+            Err(SttHandleError::NotConnected.into())
         }
     }
 
@@ -87,6 +117,12 @@ struct TtsHandle {
     client: Arc<RwLock<Option<TtsClient>>>,
     config: TtsConfig,
     last_ping: Arc<RwLock<Instant>>,
+}
+
+#[derive(Error, Debug)]
+enum TtsHandleError {
+    #[error("TTS client not connected")]
+    NotConnected,
 }
 
 impl TtsHandle {
@@ -118,8 +154,10 @@ impl TtsHandle {
     async fn process(&self, text: &str) -> anyhow::Result<()> {
         if let Some(ref client) = *self.client.read().await {
             client.process(text).await?;
+            Ok(())
+        } else {
+            Err(TtsHandleError::NotConnected.into())
         }
-        Ok(())
     }
 
     async fn next_event(&self) -> anyhow::Result<Option<TtsEvent>> {
@@ -133,7 +171,25 @@ impl TtsHandle {
                 Err(e) => Err(e.into()),
             }
         } else {
-            Ok(None)
+            Err(TtsHandleError::NotConnected.into())
+        }
+    }
+
+    async fn send_ping(&self) -> anyhow::Result<()> {
+        if let Some(ref client) = *self.client.read().await {
+            client.send_ping().await?;
+            Ok(())
+        } else {
+            Err(TtsHandleError::NotConnected.into())
+        }
+    }
+
+    async fn send_eos(&self) -> anyhow::Result<()> {
+        if let Some(ref client) = *self.client.read().await {
+            client.send_eos().await?;
+            Ok(())
+        } else {
+            Err(TtsHandleError::NotConnected.into())
         }
     }
 
@@ -231,27 +287,69 @@ async fn main() -> anyhow::Result<()> {
 
     info!("running… press Ctrl-C or send SIGTERM to stop");
 
+    let wg = WaitGroup::new();
+
+    // Task: ping STT periodically
+    let stt_ping = Arc::clone(&stt);
+    let stt_ping_wg_guard = wg.add();
+    tokio::spawn(async move {
+        let _wg_guard = stt_ping_wg_guard;
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            interval.tick().await;
+            debug!("sending STT ping");
+            if let Err(e) = stt_ping.send_ping().await {
+                warn!("STT ping error: {e}");
+                break;
+            }
+        }
+    });
+
+    // Task: ping TTS periodically
+    let tts_ping = Arc::clone(&tts);
+    let tts_ping_wg_guard = wg.add();
+    tokio::spawn(async move {
+        let _wg_guard = tts_ping_wg_guard;
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            interval.tick().await;
+            debug!("sending TTS ping");
+            if let Err(e) = tts_ping.send_ping().await {
+                warn!("TTS ping error: {e}");
+                break;
+            }
+        }
+    });
+
     // Task: capture audio → downsample → send to STT
     let stt_capture = Arc::clone(&stt);
-    let capture_task = tokio::spawn(async move {
+    let capture_wg_guard = wg.add();
+    let _capture_task = tokio::spawn(async move {
+        let _wg_guard = capture_wg_guard;
         let mut audio_chunks_sent = 0u64;
-        while let Some(pcm_48k) = capture_rx.recv().await {
-            // Convert to bytes (little-endian i16)
-            let bytes: Vec<u8> = pcm_48k.iter().flat_map(|s| s.to_le_bytes()).collect();
-            let b64_48k = BASE64.encode(&bytes);
+        loop {
+            debug!("capture task loop");
+            if let Some(pcm_48k) = capture_rx.recv().await {
+                // Convert to bytes (little-endian i16)
+                let bytes: Vec<u8> = pcm_48k.iter().flat_map(|s| s.to_le_bytes()).collect();
+                let b64_48k = BASE64.encode(&bytes);
 
-            // Downsample 48kHz → 24kHz using library function
-            let b64_24k = downsample_48_to_24_base64(&b64_48k);
+                // Downsample 48kHz → 24kHz using library function
+                let b64_24k = downsample_48_to_24_base64(&b64_48k);
 
-            // Log periodically
-            audio_chunks_sent += 1;
-            if audio_chunks_sent % 100 == 1 {
-                debug!("audio capture: chunk #{}, {} samples", audio_chunks_sent, pcm_48k.len());
-            }
+                // Log periodically
+                audio_chunks_sent += 1;
+                if audio_chunks_sent % 100 == 1 {
+                    debug!("audio capture: chunk #{}, {} samples", audio_chunks_sent, pcm_48k.len());
+                }
 
-            // Send to STT
-            if let Err(e) = stt_capture.process(&b64_24k).await {
-                warn!("STT process error: {e}");
+                // Send to STT
+                if let Err(e) = stt_capture.process(&b64_24k).await {
+                    warn!("STT process error: {e}");
+                }
+            } else {
+                info!("capture task stopping");
+                break;
             }
         }
     });
@@ -259,9 +357,12 @@ async fn main() -> anyhow::Result<()> {
     // Task: handle STT events → send text to TTS
     let stt_events = Arc::clone(&stt);
     let tts_for_stt = Arc::clone(&tts);
-    let stt_event_task = tokio::spawn(async move {
+    let stt_event_wg_guard = wg.add();
+    let _stt_event_task = tokio::spawn(async move {
+        let _wg_guard = stt_event_wg_guard;
         let mut pending_text = String::new();
         loop {
+            debug!("STT event loop");
             match stt_events.next_event().await {
                 Ok(Some(event)) => {
                     match event {
@@ -317,7 +418,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(None) => {
                     // Client not connected
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    error!("STT client not connected");
+                    break;
                 }
                 Err(e) => {
                     error!("STT event error: {e}");
@@ -329,8 +431,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Task: handle TTS events → decode audio → send to playback
     let tts_events = Arc::clone(&tts);
-    let tts_event_task = tokio::spawn(async move {
+    let tts_event_wg_guard = wg.add();
+    let _tts_event_task = tokio::spawn(async move {
+        let _wg_guard = tts_event_wg_guard;
         loop {
+            debug!("TTS event loop");
             match tts_events.next_event().await {
                 Ok(Some(event)) => {
                     match event {
@@ -383,7 +488,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(None) => {
                     // Client not connected
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    error!("TTS client not connected");
+                    break;
                 }
                 Err(e) => {
                     error!("TTS event error: {e}");
@@ -405,18 +511,23 @@ async fn main() -> anyhow::Result<()> {
             info!("received SIGINT (Ctrl-C), shutting down");
         }
     }
+    // Stop audio streams
+    info!("stopping audio capture");
+    capt.stop();
 
     // Graceful shutdown
-    info!("shutting down STT and TTS");
+    info!("shutting down STT");
     stt.shutdown().await;
+
+    info!("shutting down TTS");
     tts.shutdown().await;
 
-    // Wait for event tasks to finish
-    let _ = tokio::time::timeout(Duration::from_secs(5), stt_event_task).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), tts_event_task).await;
+    info!("stopping audio playback");
+    play.stop();
 
-    // Abort capture task
-    capture_task.abort();
+    // Wait for all tasks to finish
+    info!("waiting for all tasks to finish");
+    wg.wait().await;
 
     info!("shutdown complete");
     Ok(())
