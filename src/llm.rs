@@ -571,10 +571,15 @@ mod tests {
         std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string())
     }
 
+    fn get_endpoint() -> String {
+        std::env::var("LLM_ENDPOINT").unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string())
+    }
+
     fn create_test_client() -> Option<LlmClient> {
         let api_key = get_openai_api_key()?;
         let model = get_openai_model();
-        let config = LlmConfig::openai(api_key, model)
+        let endpoint = get_endpoint();
+        let config = LlmConfig::new(endpoint, api_key, model)
             .with_system_prompt("You are a helpful assistant. Keep responses brief.")
             .with_max_tokens(100);
         Some(LlmClient::new(config))
