@@ -158,6 +158,7 @@ impl VoiceAgent {
         // Shutdown STT
         if let Some(ref stt) = self.stt {
             info!("shutting down STT");
+            stt.set_final_shutdown();
             stt.shutdown().await;
         }
 
@@ -195,7 +196,10 @@ impl VoiceAgent {
                 debug!("sending STT ping");
                 if let Err(e) = stt.send_ping().await {
                     warn!("STT ping error: {e}");
-                    break;
+                    if stt.is_final_shutdown() {
+                        info!("STT final shutdown, stopping ping task");
+                        break;
+                    }
                 }
             }
         });
@@ -347,19 +351,23 @@ impl VoiceAgent {
                             SttEvent::Error { message, code } => {
                                 error!("STT error: {message} (code: {code})");
                             }
-                            SttEvent::EndOfStream => {
-                                info!("STT end of stream");
-                                break;
+                            SttEvent::EndOfStream|SttEvent::Close => {
+                                info!("STT end of stream or connection closed, event: {event:?}");
+
+                                if stt.is_final_shutdown() {
+                                    info!("STT final shutdown");
+                                    break;
+                                }
+                                if let Err(e) = stt.reconnect().await {
+                                    error!("STT reconnect error: {e}");
+                                    break;
+                                }
                             }
                             SttEvent::Ping => {
                                 debug!("STT ping");
                             }
                             SttEvent::Pong => {
                                 debug!("STT pong");
-                            }
-                            SttEvent::Close => {
-                                warn!("STT connection closed");
-                                break;
                             }
                             SttEvent::Frame => {
                                 debug!("STT frame");
@@ -415,13 +423,13 @@ impl VoiceAgent {
                             TtsEvent::Error { message, code } => {
                                 error!("TTS error: {message} (code: {code})");
                             }
-                            TtsEvent::EndOfStream => {
-                                info!("TTS end of stream");
+                            TtsEvent::EndOfStream|TtsEvent::Close => {
+                                info!("TTS end of stream or connection closed, event: {event:?}");
+
                                 if tts.is_final_shutdown() {
                                     info!("TTS final shutdown");
                                     break;
                                 }
-
                                 if let Err(e) = tts.reconnect().await {
                                     error!("TTS reconnect error: {e}");
                                     break;
@@ -432,10 +440,6 @@ impl VoiceAgent {
                             }
                             TtsEvent::Pong => {
                                 debug!("TTS pong");
-                            }
-                            TtsEvent::Close => {
-                                warn!("TTS connection closed");
-                                break;
                             }
                             TtsEvent::Frame => {
                                 debug!("TTS frame");

@@ -2,13 +2,17 @@ use rust_gradium::{TtsClient, TtsConfig, TtsEvent};
 use std::sync::{atomic::AtomicBool, Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::RwLock;
-use tracing::info;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{error, info};
+
+use std::collections::VecDeque;
 
 #[derive(Error, Debug)]
 pub enum TtsHandleError {
     #[error("TTS client not connected")]
     NotConnected,
+    #[error("TTS text queue is full")]
+    TextQueueFull,
 }
 
 pub struct TtsHandle {
@@ -16,6 +20,7 @@ pub struct TtsHandle {
     config: TtsConfig,
     last_ping: Arc<RwLock<Instant>>,
     final_shutdown: AtomicBool,
+    text_queue: Mutex<VecDeque<String>>,
 }
 
 impl TtsHandle {
@@ -25,6 +30,7 @@ impl TtsHandle {
             config,
             last_ping: Arc::new(RwLock::new(Instant::now())),
             final_shutdown: AtomicBool::new(false),
+            text_queue: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -36,22 +42,50 @@ impl TtsHandle {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn reconnect(&self) -> anyhow::Result<()> {
         info!("TTS reconnecting...");
         if let Some(client) = self.client.write().await.take() {
             client.shutdown().await;
         }
-        self.connect().await
+        if let Err(e) = self.connect().await {
+            error!("TTS reconnect error: {e}");
+            return Err(e);
+        }
+        self.process_queue().await?;
+        Ok(())
+    }
+
+    async fn process_queue(&self) -> anyhow::Result<()> {
+        if let Some(client) = self.client.read().await.as_ref() {
+            loop {
+                let mut text_queue = self.text_queue.lock().await;
+                if text_queue.is_empty() {
+                    break;
+                }
+                let text = text_queue.pop_front().unwrap();
+                if let Err(e) = client.process(&text).await {
+                    error!("TTS process error: {e}");
+                    text_queue.push_front(text);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn enqueue(&self, text: &str) -> anyhow::Result<()> {
+        let mut text_queue = self.text_queue.lock().await;
+        if text_queue.len() > 32 {
+            return Err(TtsHandleError::TextQueueFull.into());
+        }
+        text_queue.push_back(text.to_string());
+        Ok(())
     }
 
     pub async fn process(&self, text: &str) -> anyhow::Result<()> {
-        if let Some(ref client) = *self.client.read().await {
-            client.process(text).await?;
-            Ok(())
-        } else {
-            Err(TtsHandleError::NotConnected.into())
-        }
+        self.enqueue(text).await?;
+        self.process_queue().await?;
+        Ok(())
     }
 
     pub async fn next_event(&self) -> anyhow::Result<Option<TtsEvent>> {
