@@ -211,7 +211,10 @@ impl VoiceAgent {
                 debug!("sending TTS ping");
                 if let Err(e) = tts.send_ping().await {
                     warn!("TTS ping error: {e}");
-                    break;
+                    if tts.is_final_shutdown() {
+                        info!("TTS final shutdown, stopping ping task");
+                        break;
+                    }
                 }
             }
         });
