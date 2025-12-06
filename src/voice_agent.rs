@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::Mutex;
 use tracing::{info, error, debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
@@ -20,7 +19,7 @@ use crate::stt_handle::SttHandle;
 use crate::tts_handle::TtsHandle;
 
 pub struct VoiceAgent {
-    api_key: String,
+    config: Config,
     stt: Option<Arc<SttHandle>>,
     tts: Option<Arc<TtsHandle>>,
     llm: Option<Arc<LlmClient>>,
@@ -29,11 +28,20 @@ pub struct VoiceAgent {
     wg: WaitGroup,
 }
 
+pub struct Config {
+    pub tts_api_key: String,
+    pub stt_api_key: String,
+    pub llm_api_key: String,
+    pub llm_model: String,
+    pub llm_endpoint: String,
+    pub system_prompt: String,
+}
+
 impl VoiceAgent {
     /// Create a new VoiceAgent instance
-    pub fn new(api_key: String) -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
-            api_key,
+            config,
             stt: None,
             tts: None,
             llm: None,
@@ -51,16 +59,25 @@ impl VoiceAgent {
         let (stt_bytes_tx, stt_bytes_rx) = unbounded_channel::<Vec<u8>>();
 
         // Create STT handle
-        let stt_config = SttConfig::new(STT_ENDPOINT.to_string(), self.api_key.clone());
+        let stt_config = SttConfig::new(STT_ENDPOINT.to_string(), self.config.stt_api_key.clone());
         let stt = Arc::new(SttHandle::new(stt_config));
 
         // Create TTS handle
         let tts_config = TtsConfig::new(
             TTS_ENDPOINT.to_string(),
             DEFAULT_VOICE_ID.to_string(),
-            self.api_key.clone(),
+            self.config.tts_api_key.clone(),
         );
         let tts = Arc::new(TtsHandle::new(tts_config));
+
+        // Create LLM client
+        let llm_config = LlmConfig::new(
+            self.config.llm_endpoint.clone(),
+            self.config.llm_api_key.clone(),
+            self.config.llm_model.clone(),
+        ).with_system_prompt(&self.config.system_prompt);
+        let llm = Arc::new(LlmClient::new(llm_config));
+        info!("LLM client created");
 
         // Connect STT
         if let Err(e) = stt.connect().await {
@@ -76,21 +93,6 @@ impl VoiceAgent {
             return Err(anyhow::anyhow!("TTS connection failed: {e}"));
         }
         info!("TTS connected");
-
-        // Create LLM client
-        let llm_api_key = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
-            .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY or LLM_API_KEY environment variable not set"))?;
-        let llm_model = std::env::var("OPENAI_MODEL")
-            .or_else(|_| std::env::var("LLM_MODEL"))
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-        let llm_endpoint = std::env::var("LLM_ENDPOINT")
-            .unwrap_or_else(|_| crate::llm::endpoints::OPENAI.to_string());
-
-        let llm_config = LlmConfig::new(llm_endpoint, llm_api_key, llm_model)
-            .with_system_prompt("You are a helpful voice assistant. Keep your responses concise and conversational.");
-        let llm = Arc::new(LlmClient::new(llm_config));
-        info!("LLM client created");
 
         // Create audio capture
         let capture = match PcmCapture::new(capture_tx) {

@@ -102,7 +102,6 @@ impl SttHandle {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn send_eos(&self) -> anyhow::Result<()> {
         if let Some(ref client) = *self.client.read().await {
             client.send_eos().await?;

@@ -6,7 +6,7 @@ mod tts_handle;
 mod voice_agent;
 
 use tracing::{debug, error, info};
-use voice_agent::VoiceAgent;
+use voice_agent::{VoiceAgent, Config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,10 +19,34 @@ async fn main() -> anyhow::Result<()> {
 
     debug!("starting voice-agent");
 
-    let api_key = std::env::var("GRADIUM_API_KEY")
+    // Read configuration from environment variables
+    let gradium_api_key = std::env::var("GRADIUM_API_KEY")
         .map_err(|_| anyhow::anyhow!("GRADIUM_API_KEY environment variable not set"))?;
 
-    let mut agent = VoiceAgent::new(api_key);
+    let llm_api_key = std::env::var("OPENAI_API_KEY")
+        .or_else(|_| std::env::var("LLM_API_KEY"))
+        .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY or LLM_API_KEY environment variable not set"))?;
+
+    let llm_model = std::env::var("OPENAI_MODEL")
+        .or_else(|_| std::env::var("LLM_MODEL"))
+        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+
+    let llm_endpoint = std::env::var("LLM_ENDPOINT")
+        .unwrap_or_else(|_| llm::endpoints::OPENAI.to_string());
+
+    let system_prompt = std::env::var("SYSTEM_PROMPT")
+        .unwrap_or_else(|_| "You are a helpful voice assistant. Keep your responses concise and conversational.".to_string());
+
+    let config = Config {
+        tts_api_key: gradium_api_key.clone(),
+        stt_api_key: gradium_api_key,
+        llm_api_key,
+        llm_model,
+        llm_endpoint,
+        system_prompt,
+    };
+
+    let mut agent = VoiceAgent::new(config);
     if let Err(e) = agent.start().await {
         error!("error starting voice agent: {e}");
         return Err(e);
