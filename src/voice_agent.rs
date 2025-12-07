@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Mutex;
 use tracing::{info, error, debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
@@ -17,6 +18,7 @@ use crate::pcm_capture::PcmCapture;
 use crate::pcm_playback::PcmPlayback;
 use crate::stt_handle::SttHandle;
 use crate::tts_handle::TtsHandle;
+use crate::pause_detector::PauseDetector;
 
 pub struct VoiceAgent {
     config: Config,
@@ -26,6 +28,7 @@ pub struct VoiceAgent {
     capture: Option<PcmCapture>,
     playback: Option<PcmPlayback>,
     wg: WaitGroup,
+    pause_detector: Arc<Mutex<PauseDetector>>,
 }
 
 pub struct Config {
@@ -48,6 +51,7 @@ impl VoiceAgent {
             capture: None,
             playback: None,
             wg: WaitGroup::new(),
+            pause_detector: Arc::new(Mutex::new(PauseDetector::new())),
         }
     }
 
@@ -335,6 +339,7 @@ impl VoiceAgent {
     }
 
     fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, llm_input_tx: UnboundedSender<String>) {
+        let pause_detector = self.pause_detector.clone();
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
@@ -345,22 +350,26 @@ impl VoiceAgent {
                     Ok(Some(event)) => {
                         match event {
                             SttEvent::Step { vad, .. } => {
-                                if vad.len() > 2 && vad[2].inactivity_prob > 0.5 {
-                                    let inactivity_prob = vad[2].inactivity_prob;
+                                let mut inactivity_prob = 0.0f32;
+                                if vad.len() > 2 {
+                                    inactivity_prob = vad[2].inactivity_prob;
+                                }
 
-                                    info!("user inactive (prob: {:.2})", inactivity_prob);
+                                let mut pd = pause_detector.lock().await;
+                                pd.add_inactivity_prob(inactivity_prob);
 
-                                    if !pending_text.trim().is_empty() && inactivity_prob > 0.99 {
-                                        let user_input = pending_text.trim().to_string();
-                                        pending_text.clear();
+                                if pd.is_paused() && !pending_text.trim().is_empty() {
+                                    let user_input = pending_text.trim().to_string();
+                                    pending_text.clear();
 
-                                        info!("User said: '{}'", user_input);
+                                    info!("User said: '{}'", user_input);
 
-                                        // Send to LLM task
-                                        if let Err(e) = llm_input_tx.send(user_input) {
-                                            warn!("Failed to send to LLM task: {e}");
-                                        }
+                                    // Send to LLM task
+                                    if let Err(e) = llm_input_tx.send(user_input) {
+                                        warn!("Failed to send to LLM task: {e}");
                                     }
+
+                                    pd.reset();
                                 }
                             }
                             SttEvent::Text { text, start } => {
@@ -369,6 +378,7 @@ impl VoiceAgent {
                                     pending_text.push(' ');
                                     pending_text.push_str(&text);
                                 }
+                                pause_detector.lock().await.add_text(&text);
                             }
                             SttEvent::EndText { stop } => {
                                 debug!("STT end text at {stop:.2}s");
@@ -456,10 +466,10 @@ impl VoiceAgent {
                                             }
                                         }
                                         LlmChunk::Done => {
-                                            info!("LLM response complete, sending EOS to TTS");
+                                            info!("LLM response complete");
                                             // Send any remaining text
                                             if !sentence_buffer.trim().is_empty() {
-                                                info!("Sending remaining to TTS: '{}'", sentence_buffer.trim());
+                                                info!("LLM sending remaining to TTS: '{}'", sentence_buffer.trim());
                                                 if let Err(e) = tts.process(sentence_buffer.trim()).await {
                                                     warn!("TTS process error: {e}");
                                                 }
