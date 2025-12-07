@@ -338,6 +338,7 @@ impl VoiceAgent {
         });
     }
 
+    const VAD_INDEX_TO_CHECK: usize = 2;
     fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, llm_input_tx: UnboundedSender<String>) {
         let pause_detector = self.pause_detector.clone();
         let wg_guard = self.wg.add();
@@ -351,8 +352,8 @@ impl VoiceAgent {
                         match event {
                             SttEvent::Step { vad, .. } => {
                                 let mut inactivity_prob = 0.0f32;
-                                if vad.len() > 2 {
-                                    inactivity_prob = vad[2].inactivity_prob;
+                                if vad.len() > Self::VAD_INDEX_TO_CHECK {
+                                    inactivity_prob = vad[Self::VAD_INDEX_TO_CHECK].inactivity_prob;
                                 }
 
                                 let mut pd = pause_detector.lock().await;
@@ -373,12 +374,13 @@ impl VoiceAgent {
                                 }
                             }
                             SttEvent::Text { text, start } => {
+                                let trimmed_text = text.trim();
                                 info!("STT text: '{text}' at {start:.2}s");
-                                if !text.trim().is_empty() {
+                                if !trimmed_text.is_empty() {
                                     pending_text.push(' ');
-                                    pending_text.push_str(&text);
+                                    pending_text.push_str(&trimmed_text);
                                 }
-                                pause_detector.lock().await.add_text(&text);
+                                pause_detector.lock().await.add_text(&trimmed_text);
                             }
                             SttEvent::EndText { stop } => {
                                 debug!("STT end text at {stop:.2}s");
@@ -454,7 +456,7 @@ impl VoiceAgent {
                                             sentence_buffer.push_str(&text);
 
                                             // Send complete sentences to TTS for faster response
-                                            if let Some(pos) = sentence_buffer.rfind(['.', '!', '?', '\n']) {
+                                            while let Some(pos) = sentence_buffer.find(['.', '!', '?', '\n']) {
                                                 let to_send = &sentence_buffer[..=pos];
                                                 if !to_send.trim().is_empty() {
                                                     info!("Sending to TTS: '{}'", to_send.trim());
