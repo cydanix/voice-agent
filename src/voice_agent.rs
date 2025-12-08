@@ -1,8 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
-use rust_gradium::{
-    downsample_48_to_24, SttConfig, SttEvent, TtsConfig, TtsEvent,
-};
+use rust_gradium::{SttConfig, SttEvent, TtsConfig, TtsEvent};
 use rust_gradium::wg::WaitGroup;
 
 use std::sync::Arc;
@@ -281,19 +279,19 @@ impl VoiceAgent {
             let mut audio_chunks_sent = 0u64;
             loop {
                 debug!("capture task loop");
-                if let Some(pcm_48k) = capture_rx.recv().await {
+                // PcmCapture now outputs 24kHz samples directly
+                if let Some(pcm_24k) = capture_rx.recv().await {
                     // Log periodically
                     audio_chunks_sent += 1;
                     if audio_chunks_sent % 100 == 1 {
-                        info!("audio capture: chunk #{}, {} samples", audio_chunks_sent, pcm_48k.len());
+                        info!("audio capture: chunk #{}, {} samples", audio_chunks_sent, pcm_24k.len());
                     }
 
                     // Convert to bytes (little-endian i16)
-                    let bytes: Vec<u8> = pcm_48k.iter().flat_map(|s| s.to_le_bytes()).collect();
-                    let bytes_24k = downsample_48_to_24(&bytes);
+                    let bytes: Vec<u8> = pcm_24k.iter().flat_map(|s| s.to_le_bytes()).collect();
 
                     // Send to STT bytes queue
-                    if let Err(e) = stt_bytes_tx.send(bytes_24k) {
+                    if let Err(e) = stt_bytes_tx.send(bytes) {
                         warn!("STT bytes queue send error: {e}");
                         break;
                     }
