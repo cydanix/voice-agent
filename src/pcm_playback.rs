@@ -5,25 +5,24 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc as std_mpsc;
 use tracing::{error, debug, info};
-
-enum PlaybackCommand {
-    Stop,
-    Start,
-}
 
 /// A Send-safe handle for controlling playback from async tasks
 #[derive(Clone)]
 pub struct PcmPlaybackController {
-    command_tx: std_mpsc::Sender<PlaybackCommand>,
+    queue: Arc<Mutex<VecDeque<i16>>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl PcmPlaybackController {
+    /// Clear pending audio and resume playback (e.g., when user interrupts)
     pub fn restart(&self) -> Result<()> {
-        let _ = self.command_tx.send(PlaybackCommand::Stop);
-        self.command_tx.send(PlaybackCommand::Start)
-            .map_err(|_| anyhow::anyhow!("playback command channel closed"))
+        if let Ok(mut buf) = self.queue.lock() {
+            buf.clear();
+        }
+        self.stopped.store(false, Ordering::Relaxed);
+        info!("playback restarted");
+        Ok(())
     }
 }
 
@@ -31,7 +30,6 @@ pub struct PcmPlayback {
     stream: cpal::Stream,
     queue: Arc<Mutex<VecDeque<i16>>>,
     stopped: Arc<AtomicBool>,
-    command_rx: std_mpsc::Receiver<PlaybackCommand>,
     controller: PcmPlaybackController,
 }
 
@@ -93,25 +91,17 @@ impl PcmPlayback {
             None,
         )?;
 
-        let (command_tx, command_rx) = std_mpsc::channel();
-        let controller = PcmPlaybackController { command_tx };
+        let controller = PcmPlaybackController {
+            queue: Arc::clone(&queue),
+            stopped: Arc::clone(&stopped),
+        };
 
-        Ok(Self { stream, queue, stopped, command_rx, controller })
+        Ok(Self { stream, queue, stopped, controller })
     }
 
     /// Get a Send-safe controller for this playback
     pub fn controller(&self) -> PcmPlaybackController {
         self.controller.clone()
-    }
-
-    /// Process any pending commands (call this periodically from the main thread)
-    pub fn process_commands(&self) {
-        while let Ok(cmd) = self.command_rx.try_recv() {
-            match cmd {
-                PlaybackCommand::Stop => self.stop(),
-                PlaybackCommand::Start => { let _ = self.start(); }
-            }
-        }
     }
 
     pub fn start(&self) -> Result<()> {
