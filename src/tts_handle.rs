@@ -5,6 +5,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
+use std::sync::atomic::AtomicUsize;
 use std::collections::VecDeque;
 
 #[derive(Error, Debug)]
@@ -21,6 +22,8 @@ pub struct TtsHandle {
     last_ping: Arc<RwLock<Instant>>,
     final_shutdown: AtomicBool,
     text_queue: Mutex<VecDeque<String>>,
+    inflight_requests: AtomicUsize,
+    reconnecting: AtomicBool,
 }
 
 impl TtsHandle {
@@ -31,19 +34,27 @@ impl TtsHandle {
             last_ping: Arc::new(RwLock::new(Instant::now())),
             final_shutdown: AtomicBool::new(false),
             text_queue: Mutex::new(VecDeque::new()),
+            inflight_requests: AtomicUsize::new(0),
+            reconnecting: AtomicBool::new(false),
         }
     }
 
     pub async fn connect(&self) -> anyhow::Result<()> {
         let client = TtsClient::new(self.config.clone());
         client.start().await?;
-        *self.client.write().await = Some(client);
+        {
+            let mut client_ptr = self.client.write().await;
+            *client_ptr = Some(client);
+            self.inflight_requests.store(0, Ordering::SeqCst);
+        }
         *self.last_ping.write().await = Instant::now();
         Ok(())
     }
 
     pub async fn reconnect(&self) -> anyhow::Result<()> {
         info!("TTS reconnecting...");
+        self.reconnecting.store(true, Ordering::SeqCst);
+
         if let Some(client) = self.client.write().await.take() {
             client.shutdown().await;
         }
@@ -52,6 +63,28 @@ impl TtsHandle {
             return Err(e);
         }
         self.process_queue().await?;
+
+        self.reconnecting.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn set_reconnecting(&self) {
+        info!("TTS: setting reconnecting");
+        self.reconnecting.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::SeqCst)
+    }
+
+    pub async fn cancel(&self) -> anyhow::Result<()> {
+        if self.inflight_requests.load(Ordering::SeqCst) > 0 {
+            info!("TTS: cancelling inflight requests");
+            self.text_queue.lock().await.clear();
+            self.reconnect().await?;
+        } else {
+            info!("TTS: no inflight requests to cancel");
+        }
         Ok(())
     }
 
@@ -67,6 +100,8 @@ impl TtsHandle {
                     error!("TTS process error: {e}");
                     text_queue.push_front(text);
                     break;
+                } else {
+                    self.inflight_requests.fetch_add(1, Ordering::SeqCst);
                 }
             }
         }
@@ -134,6 +169,10 @@ impl TtsHandle {
 
     pub fn is_final_shutdown(&self) -> bool {
         self.final_shutdown.load(Ordering::SeqCst)
+    }
+
+    pub fn inflight_requests(&self) -> usize {
+        self.inflight_requests.load(Ordering::SeqCst)
     }
 
     #[allow(dead_code)]

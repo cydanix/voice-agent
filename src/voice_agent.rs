@@ -2,7 +2,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
 use rust_gradium::{
     downsample_48_to_24, SttConfig, SttEvent, TtsConfig, TtsEvent,
-    STT_ENDPOINT, TTS_ENDPOINT, DEFAULT_VOICE_ID,
 };
 use rust_gradium::wg::WaitGroup;
 
@@ -15,7 +14,7 @@ use tracing::{info, error, debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
 use crate::pcm_capture::PcmCapture;
-use crate::pcm_playback::PcmPlayback;
+use crate::pcm_playback::{PcmPlayback, PcmPlaybackController};
 use crate::stt_handle::SttHandle;
 use crate::tts_handle::TtsHandle;
 use crate::pause_detector::PauseDetector;
@@ -43,6 +42,15 @@ pub struct Config {
     pub system_prompt: String,
 }
 
+enum VoiceAgentEvent {
+    UserInput(String),
+    UserBreak(String),
+    TtsCloseOrEos,
+    Error,
+    LlmResponseChunk(String),
+    LlmResponseDone(String),
+}
+
 impl VoiceAgent {
     /// Create a new VoiceAgent instance
     pub fn new(config: Config) -> Self {
@@ -64,6 +72,7 @@ impl VoiceAgent {
         let (capture_tx, capture_rx) = unbounded_channel::<Vec<i16>>();
         let (playback_tx, playback_rx) = unbounded_channel::<Vec<i16>>();
         let (stt_bytes_tx, stt_bytes_rx) = unbounded_channel::<Vec<u8>>();
+        let (event_tx, event_rx) = unbounded_channel::<VoiceAgentEvent>();
 
         // Create STT handle
         let stt_config = SttConfig::new(self.config.stt_endpoint.clone(), self.config.stt_api_key.clone());
@@ -122,6 +131,7 @@ impl VoiceAgent {
                 return Err(e);
             }
         };
+        let playback_controller = playback.controller();
 
         // Start audio streams
         if let Err(e) = capture.start() {
@@ -147,9 +157,10 @@ impl VoiceAgent {
         self.spawn_tts_ping_task(Arc::clone(&tts));
         self.spawn_capture_task(stt_bytes_tx, capture_rx);
         self.spawn_stt_sender_task(Arc::clone(&stt), stt_bytes_rx);
-        self.spawn_stt_event_task(Arc::clone(&stt), llm_input_tx);
-        self.spawn_llm_task(Arc::clone(&llm), Arc::clone(&tts), llm_input_rx);
-        self.spawn_tts_event_task(Arc::clone(&tts), playback_tx);
+        self.spawn_stt_event_task(Arc::clone(&stt), event_tx.clone());
+        self.spawn_llm_task(Arc::clone(&llm), Arc::clone(&tts), llm_input_rx, event_tx.clone());
+        self.spawn_tts_event_task(Arc::clone(&tts), playback_tx, event_tx.clone());
+        self.spawn_main_loop_task(Arc::clone(&tts), Arc::clone(&llm), playback_controller, event_rx, llm_input_tx.clone());
 
         // Store handles
         self.stt = Some(stt);
@@ -342,7 +353,7 @@ impl VoiceAgent {
     }
 
     const VAD_INDEX_TO_CHECK: usize = 2;
-    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, llm_input_tx: UnboundedSender<String>) {
+    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, event_tx: UnboundedSender<VoiceAgentEvent>) {
         let pause_detector = self.pause_detector.clone();
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
@@ -369,7 +380,7 @@ impl VoiceAgent {
                                     info!("User said: '{}'", user_input);
 
                                     // Send to LLM task
-                                    if let Err(e) = llm_input_tx.send(user_input) {
+                                    if let Err(e) = event_tx.send(VoiceAgentEvent::UserInput(user_input)) {
                                         warn!("Failed to send to LLM task: {e}");
                                     }
 
@@ -382,6 +393,10 @@ impl VoiceAgent {
                                 if !trimmed_text.is_empty() {
                                     pending_text.push(' ');
                                     pending_text.push_str(&trimmed_text);
+
+                                    if let Err(e) = event_tx.send(VoiceAgentEvent::UserBreak(trimmed_text.to_string())) {
+                                        warn!("Failed to send to UserBreak event: {e}");
+                                    }
                                 }
                                 pause_detector.lock().await.add_text(&trimmed_text);
                             }
@@ -396,15 +411,7 @@ impl VoiceAgent {
                             }
                             SttEvent::EndOfStream|SttEvent::Close => {
                                 info!("STT end of stream or connection closed, event: {event:?}");
-
-                                if stt.is_final_shutdown() {
-                                    info!("STT final shutdown");
-                                    break;
-                                }
-                                if let Err(e) = stt.reconnect().await {
-                                    error!("STT reconnect error: {e}");
-                                    break;
-                                }
+                                break
                             }
                             SttEvent::Ping => {
                                 debug!("STT ping");
@@ -433,8 +440,9 @@ impl VoiceAgent {
     fn spawn_llm_task(
         &self,
         llm: Arc<LlmClient>,
-        tts: Arc<TtsHandle>,
+        _tts: Arc<TtsHandle>,
         mut llm_input_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        event_tx: UnboundedSender<VoiceAgentEvent>,
     ) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
@@ -462,9 +470,9 @@ impl VoiceAgent {
                                             while let Some(pos) = sentence_buffer.find(['.', '!', '?', '\n']) {
                                                 let to_send = &sentence_buffer[..=pos];
                                                 if !to_send.trim().is_empty() {
-                                                    info!("Sending to TTS: '{}'", to_send.trim());
-                                                    if let Err(e) = tts.process(to_send.trim()).await {
-                                                        warn!("TTS process error: {e}");
+                                                    info!("LLM sending to TTS: '{}'", to_send.trim());
+                                                    if let Err(e) = event_tx.send(VoiceAgentEvent::LlmResponseChunk(to_send.trim().to_string())) {
+                                                        warn!("Failed to send to LlmResponseChunk event: {e}");
                                                     }
                                                 }
                                                 sentence_buffer = sentence_buffer[pos + 1..].to_string();
@@ -473,16 +481,9 @@ impl VoiceAgent {
                                         LlmChunk::Done => {
                                             info!("LLM response complete");
                                             // Send any remaining text
-                                            if !sentence_buffer.trim().is_empty() {
-                                                info!("LLM sending remaining to TTS: '{}'", sentence_buffer.trim());
-                                                if let Err(e) = tts.process(sentence_buffer.trim()).await {
-                                                    warn!("TTS process error: {e}");
-                                                }
-                                            }
-                                            // Send EOS to TTS
-                                            info!("LLM response complete, sending EOS to TTS");
-                                            if let Err(e) = tts.send_eos().await {
-                                                warn!("TTS send eos error: {e}");
+                                            let last_text = sentence_buffer.trim().to_string();
+                                            if let Err(e) = event_tx.send(VoiceAgentEvent::LlmResponseDone(last_text)) {
+                                                warn!("Failed to send to LlmResponseDone event: {e}");
                                             }
                                             info!("LLM response: '{}'", full_response);
                                             break;
@@ -499,6 +500,9 @@ impl VoiceAgent {
                             }
                             Err(e) => {
                                 error!("LLM chat error: {e}");
+                                if let Err(e) = event_tx.send(VoiceAgentEvent::Error) {
+                                    warn!("Failed to send to Error event: {e}");
+                                }
                             }
                         }
                     }
@@ -511,12 +515,22 @@ impl VoiceAgent {
         });
     }
 
-    fn spawn_tts_event_task(&self, tts: Arc<TtsHandle>, playback_tx: UnboundedSender<Vec<i16>>) {
+    fn spawn_tts_event_task(&self, tts: Arc<TtsHandle>, playback_tx: UnboundedSender<Vec<i16>>, event_tx: UnboundedSender<VoiceAgentEvent>) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
             loop {
                 debug!("TTS event loop");
+                if tts.is_reconnecting() {
+                    debug!("TTS reconnecting, skipping event loop");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if tts.is_final_shutdown() {
+                        info!("TTS final shutdown, stopping event loop");
+                        break;
+                    }
+                    continue;
+                }
+
                 match tts.next_event().await {
                     Ok(Some(event)) => {
                         match event {
@@ -546,17 +560,17 @@ impl VoiceAgent {
                             }
                             TtsEvent::Error { message, code } => {
                                 error!("TTS error: {message} (code: {code})");
+                                if let Err(e) = event_tx.send(VoiceAgentEvent::Error) {
+                                    warn!("Failed to send to Error event: {e}");
+                                }
+                                break;
                             }
                             TtsEvent::EndOfStream|TtsEvent::Close => {
                                 info!("TTS end of stream or connection closed, event: {event:?}");
 
-                                if tts.is_final_shutdown() {
-                                    info!("TTS final shutdown");
-                                    break;
-                                }
-                                if let Err(e) = tts.reconnect().await {
-                                    error!("TTS reconnect error: {e}");
-                                    break;
+                                tts.set_reconnecting();
+                                if let Err(e) = event_tx.send(VoiceAgentEvent::TtsCloseOrEos) {
+                                    warn!("Failed to send to TtsCloseOrEos event: {e}");
                                 }
                             }
                             TtsEvent::Ping => {
@@ -572,10 +586,96 @@ impl VoiceAgent {
                     }
                     Ok(None) => {
                         error!("TTS client not connected");
+                        if let Err(e) = event_tx.send(VoiceAgentEvent::Error) {
+                            warn!("Failed to send to Error event: {e}");
+                        }
                         break;
                     }
                     Err(e) => {
                         error!("TTS event error: {e}");
+                        if let Err(e) = event_tx.send(VoiceAgentEvent::Error) {
+                            warn!("Failed to send to Error event: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+
+    fn spawn_main_loop_task(
+        &self,
+        tts: Arc<TtsHandle>,
+        llm: Arc<LlmClient>,
+        playback_controller: PcmPlaybackController,
+        mut event_rx: tokio::sync::mpsc::UnboundedReceiver<VoiceAgentEvent>,
+        llm_input_tx: UnboundedSender<String>,
+    ) {
+        let wg_guard = self.wg.add();
+        tokio::spawn(async move {
+            let _wg_guard = wg_guard;
+            loop {
+                match event_rx.recv().await {
+                    Some(event) => {
+                        match event {
+                            VoiceAgentEvent::UserInput(input) => {
+                                info!("User input: '{}'", input);
+                                if let Err(e) = llm_input_tx.send(input) {
+                                    warn!("Failed to send to LLM task: {e}");
+                                }
+                            }
+                            VoiceAgentEvent::UserBreak(text) => {
+                                info!("User break: '{}'", text);
+                                llm.cancel();
+                                if let Err(e) = tts.cancel().await {
+                                    error!("Failed to cancel TTS: {e}");
+                                }
+                                if let Err(e) = playback_controller.restart() {
+                                    error!("Failed to start playback: {e}");
+                                }
+                                info!("User break complete");
+                            }
+                            VoiceAgentEvent::TtsCloseOrEos => {
+                                info!("TTS close or EOS");
+                                if tts.is_final_shutdown() {
+                                    info!("TTS final shutdown");
+                                    break;
+                                }
+                                if let Err(e) = tts.reconnect().await {
+                                    error!("TTS reconnect error: {e}");
+                                    break;
+                                }
+                                if tts.is_final_shutdown() {
+                                    info!("TTS final shutdown after reconnect");
+                                    break;
+                                }
+                            }
+                            VoiceAgentEvent::Error => {
+                                error!("Received Error event");
+                                break;
+                            }
+                            VoiceAgentEvent::LlmResponseChunk(text) => {
+                                info!("LLM response chunk: '{}'", text);
+                                if let Err(e) = tts.process(&text).await {
+                                    warn!("TTS process error: {e}");
+                                }
+                            }
+                            VoiceAgentEvent::LlmResponseDone(text) => {
+                                info!("LLM response done: '{}'", text);
+                                if !text.is_empty() {
+                                    if let Err(e) = tts.process(&text).await {
+                                        warn!("TTS process error: {e}");
+                                    }
+                                }
+                                if let Err(e) = tts.send_eos().await {
+                                    warn!("TTS send eos error: {e}");
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        info!("Main loop task stopping (channel closed)");
                         break;
                     }
                 }
