@@ -166,7 +166,8 @@ impl PauseDetector {
                     let confirmation_ms = self.pause_first_detected
                         .map(|t| t.elapsed().as_millis())
                         .unwrap_or(0);
-                    info!(
+
+                    debug!(
                         elapsed_ms = elapsed_ms,
                         min_prob = self.min_inactivity_prob,
                         current_prob = self.current_inactivity_prob,
