@@ -21,6 +21,7 @@ pub struct SttHandle {
     last_ping: Arc<RwLock<Instant>>,
     final_shutdown: AtomicBool,
     audio_queue: Mutex<VecDeque<String>>,
+    reconnecting: AtomicBool,
 }
 
 impl SttHandle {
@@ -31,6 +32,7 @@ impl SttHandle {
             last_ping: Arc::new(RwLock::new(Instant::now())),
             final_shutdown: AtomicBool::new(false),
             audio_queue: Mutex::new(VecDeque::new()),
+            reconnecting: AtomicBool::new(false),
         }
     }
 
@@ -44,6 +46,8 @@ impl SttHandle {
 
     pub async fn reconnect(&self) -> anyhow::Result<()> {
         info!("STT reconnecting...");
+        self.reconnecting.store(true, Ordering::SeqCst);
+
         if let Some(client) = self.client.write().await.take() {
             client.shutdown().await;
         }
@@ -52,7 +56,18 @@ impl SttHandle {
             return Err(e);
         }
         self.process_queue().await?;
+
+        self.reconnecting.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub fn set_reconnecting(&self) {
+        info!("STT: setting reconnecting");
+        self.reconnecting.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::SeqCst)
     }
 
     async fn process_queue(&self) -> anyhow::Result<()> {
@@ -64,7 +79,7 @@ impl SttHandle {
                 }
                 let audio = audio_queue.pop_front().unwrap();
                 if let Err(e) = client.process(&audio).await {
-                    error!("TTS process error: {e}");
+                    error!("STT process error: {e}");
                     audio_queue.push_front(audio);
                     break;
                 }

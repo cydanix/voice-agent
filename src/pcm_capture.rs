@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{error, debug, info};
+use tracing::{error, info};
 
 pub struct PcmCapture {
     stream: cpal::Stream,
@@ -17,7 +17,10 @@ impl PcmCapture {
     pub fn new(tx: UnboundedSender<Vec<i16>>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host.default_input_device().ok_or(anyhow::anyhow!("no input device"))?;
+        let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
+        info!("audio capture using device: {}", device_name);
         let supported = device.default_input_config()?;
+        info!("device default config: {:?}", supported);
         let sample_format = supported.sample_format();
 
         let config = StreamConfig {
@@ -50,7 +53,7 @@ impl PcmCapture {
         i16: FromSample<T>,
     {
         let err_fn = |e| error!("capture stream error: {e}");
-        debug!("building input stream with config: {:?}", config);
+        info!("building input stream with config: {:?}", config);
         let stream = device.build_input_stream(
             config,
             move |data: &[T], _| {
