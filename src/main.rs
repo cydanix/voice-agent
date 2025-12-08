@@ -24,6 +24,14 @@ async fn main() -> anyhow::Result<()> {
     let gradium_api_key = std::env::var("GRADIUM_API_KEY")
         .map_err(|_| anyhow::anyhow!("GRADIUM_API_KEY environment variable not set"))?;
 
+    let stt_endpoint = std::env::var("GRADIUM_STT_ENDPOINT")
+        .unwrap_or_else(|_| rust_gradium::STT_ENDPOINT.to_string());
+    let tts_endpoint = std::env::var("GRADIUM_TTS_ENDPOINT")
+        .unwrap_or_else(|_| rust_gradium::TTS_ENDPOINT.to_string());
+
+    let voice_id = std::env::var("GRADIUM_VOICE_ID")
+        .unwrap_or_else(|_| rust_gradium::DEFAULT_VOICE_ID.to_string());
+
     let llm_api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("LLM_API_KEY"))
         .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY or LLM_API_KEY environment variable not set"))?;
@@ -40,7 +48,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config {
         tts_api_key: gradium_api_key.clone(),
+        tts_endpoint: tts_endpoint,
+        stt_endpoint: stt_endpoint,
         stt_api_key: gradium_api_key,
+        voice_id: voice_id,
         llm_api_key,
         llm_model,
         llm_endpoint,
