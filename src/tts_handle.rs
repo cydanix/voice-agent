@@ -27,6 +27,8 @@ pub struct TtsHandle {
 }
 
 impl TtsHandle {
+    const MAX_TEXT_QUEUE_SIZE: usize = 64;
+
     pub fn new(config: TtsConfig) -> Self {
         Self {
             client: Arc::new(RwLock::new(None)),
@@ -110,7 +112,7 @@ impl TtsHandle {
 
     async fn enqueue(&self, text: &str) -> anyhow::Result<()> {
         let mut text_queue = self.text_queue.lock().await;
-        if text_queue.len() > 32 {
+        if text_queue.len() > Self::MAX_TEXT_QUEUE_SIZE {
             return Err(TtsHandleError::TextQueueFull.into());
         }
         text_queue.push_back(text.to_string());
