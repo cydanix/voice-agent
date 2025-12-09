@@ -154,9 +154,9 @@ impl VoiceAgent {
         // Spawn background tasks
         self.spawn_stt_ping_task(Arc::clone(&stt));
         self.spawn_tts_ping_task(Arc::clone(&tts));
-        self.spawn_capture_task(stt_bytes_tx, capture_rx);
+        self.spawn_capture_task(stt_bytes_tx.clone(), capture_rx);
         self.spawn_stt_sender_task(Arc::clone(&stt), stt_bytes_rx);
-        self.spawn_stt_event_task(Arc::clone(&stt), event_tx.clone());
+        self.spawn_stt_event_task(Arc::clone(&stt), stt_bytes_tx, event_tx.clone());
         self.spawn_llm_task(Arc::clone(&llm), Arc::clone(&tts), llm_input_rx, event_tx.clone());
         self.spawn_tts_event_task(Arc::clone(&tts), playback_tx, event_tx.clone());
         self.spawn_main_loop_task(Arc::clone(&stt), Arc::clone(&tts), Arc::clone(&llm), playback_controller, event_rx, llm_input_tx.clone());
@@ -246,6 +246,7 @@ impl VoiceAgent {
                     }
                 }
             }
+            info!("STT ping task stopped");
         });
     }
 
@@ -265,6 +266,7 @@ impl VoiceAgent {
                     }
                 }
             }
+            info!("TTS ping task stopped");
         });
     }
 
@@ -300,6 +302,7 @@ impl VoiceAgent {
                     break;
                 }
             }
+            info!("capture task stopped");
         });
     }
 
@@ -316,8 +319,14 @@ impl VoiceAgent {
             let _wg_guard = wg_guard;
             let mut buffer: Vec<u8> = Vec::new();
             let mut chunks_sent = 0u64;
+            let mut critical_error = false;
 
             loop {
+
+                if critical_error {
+                    break;
+                }
+
                 if let Some(bytes) = stt_bytes_rx.recv().await {
                     buffer.extend(bytes);
 
@@ -333,6 +342,7 @@ impl VoiceAgent {
 
                         if let Err(e) = stt.process(&b64).await {
                             error!("STT process error: {e}");
+                            critical_error = true;
                             break;
                         }
                     }
@@ -350,16 +360,18 @@ impl VoiceAgent {
                     break;
                 }
             }
+            info!("STT sender task stopped");
         });
     }
 
     const VAD_INDEX_TO_CHECK: usize = 2;
-    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, event_tx: UnboundedSender<VoiceAgentEvent>) {
+    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, stt_bytes_tx: UnboundedSender<Vec<u8>>, event_tx: UnboundedSender<VoiceAgentEvent>) {
         let pause_detector = self.pause_detector.clone();
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
             let mut pending_text = String::new();
+            let mut flushed = false;
             loop {
                 debug!("STT event loop");
                 if stt.is_reconnecting() {
@@ -384,8 +396,22 @@ impl VoiceAgent {
                                 let mut pd = pause_detector.lock().await;
                                 pd.add_inactivity_prob(inactivity_prob);
 
-                                if pd.is_paused() && !pending_text.trim().is_empty() {
-                                    let user_input = pending_text.trim().to_string();
+
+                                // flush STT by silence
+                                if !pending_text.is_empty() && pd.is_in_high_inactivity() && !pd.is_paused() && !flushed {
+                                    info!("Flushing STT by silence");
+                                    let silent_chunk_bytes = vec![0u8; 14 * Self::STT_CHUNK_BYTES];
+                                    if let Err(e) = stt_bytes_tx.send(silent_chunk_bytes) {
+                                        error!("Failed to send silent chunk to STT: {e}");
+                                        break;
+                                    }
+                                    info!("STT flushed by silence");
+                                    flushed = true;
+                                    pd.on_flush();
+                                }
+
+                                if !pending_text.is_empty() && pd.is_paused() {
+                                    let user_input = pending_text.to_string();
                                     pending_text.clear();
 
                                     info!("User said: '{}'", user_input);
@@ -396,6 +422,7 @@ impl VoiceAgent {
                                     }
 
                                     pd.reset();
+                                    flushed = false;
                                 }
                             }
                             SttEvent::Text { text, start } => {
@@ -449,6 +476,7 @@ impl VoiceAgent {
                     }
                 }
             }
+            info!("STT event loop stopped");
         });
     }
 
@@ -527,6 +555,7 @@ impl VoiceAgent {
                     }
                 }
             }
+            info!("LLM event loop stopped");
         });
     }
 
@@ -615,6 +644,7 @@ impl VoiceAgent {
                     }
                 }
             }
+            info!("TTS event loop stopped");
         });
     }
 
@@ -717,6 +747,7 @@ impl VoiceAgent {
                     }
                 }
             }
+            info!("Main loop task stopped");
         });
     }
 }
