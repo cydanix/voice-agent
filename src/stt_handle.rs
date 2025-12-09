@@ -25,6 +25,8 @@ pub struct SttHandle {
 }
 
 impl SttHandle {
+    const MAX_AUDIO_QUEUE_SIZE: usize = 64;
+
     pub fn new(config: SttConfig) -> Self {
         Self {
             client: Arc::new(RwLock::new(None)),
@@ -90,7 +92,7 @@ impl SttHandle {
 
     async fn enqueue(&self, audio: &str) -> anyhow::Result<()> {
         let mut audio_queue = self.audio_queue.lock().await;
-        if audio_queue.len() > 32 {
+        if audio_queue.len() > Self::MAX_AUDIO_QUEUE_SIZE {
             return Err(SttHandleError::AudioQueueFull.into());
         }
         audio_queue.push_back(audio.to_string());
