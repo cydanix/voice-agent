@@ -8,7 +8,7 @@ pub struct PauseDetector {
 }
 
 impl PauseDetector {
-    const PAUSE_THRESHOLD_MS: u64 = 200;
+    const PAUSE_THRESHOLD_MS: u64 = 0;
     const FLUSH_THRESHOLD_MS: u64 = 300;
     const PAUSE_THRESHOLD_INACTIVITY_PROB: f32 = 0.7;
 
