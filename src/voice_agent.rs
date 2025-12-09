@@ -29,15 +29,16 @@ pub struct VoiceAgent {
 }
 
 pub struct Config {
-    pub tts_api_key: String,
-    pub tts_endpoint: String,
     pub stt_api_key: String,
     pub stt_endpoint: String,
-    pub voice_id: String,
+    pub stt_language: String,
+    pub tts_api_key: String,
+    pub tts_endpoint: String,
+    pub tts_voice_id: String,
     pub llm_api_key: String,
     pub llm_model: String,
     pub llm_endpoint: String,
-    pub system_prompt: String,
+    pub llm_system_prompt: String,
 }
 
 enum VoiceAgentEvent {
@@ -74,13 +75,16 @@ impl VoiceAgent {
         let (event_tx, event_rx) = unbounded_channel::<VoiceAgentEvent>();
 
         // Create STT handle
-        let stt_config = SttConfig::new(self.config.stt_endpoint.clone(), self.config.stt_api_key.clone());
+        let stt_config = SttConfig::new(self.config.stt_endpoint.clone(),
+            self.config.stt_api_key.clone(),
+            self.config.stt_language.clone(),
+        );
         let stt = Arc::new(SttHandle::new(stt_config));
 
         // Create TTS handle
         let tts_config = TtsConfig::new(
             self.config.tts_endpoint.clone(),
-            self.config.voice_id.clone(),
+            self.config.tts_voice_id.clone(),
             self.config.tts_api_key.clone(),
         );
         let tts = Arc::new(TtsHandle::new(tts_config));
@@ -90,7 +94,7 @@ impl VoiceAgent {
             self.config.llm_endpoint.clone(),
             self.config.llm_api_key.clone(),
             self.config.llm_model.clone(),
-        ).with_system_prompt(&self.config.system_prompt);
+        ).with_system_prompt(&self.config.llm_system_prompt);
         let llm = Arc::new(LlmClient::new(llm_config));
         info!("LLM client created");
 

@@ -26,11 +26,15 @@ async fn main() -> anyhow::Result<()> {
 
     let stt_endpoint = std::env::var("GRADIUM_STT_ENDPOINT")
         .unwrap_or_else(|_| rust_gradium::STT_ENDPOINT.to_string());
+
+    let stt_language = std::env::var("GRADIUM_STT_LANGUAGE")
+        .unwrap_or_else(|_| "en".to_string());
+
     let tts_endpoint = std::env::var("GRADIUM_TTS_ENDPOINT")
         .unwrap_or_else(|_| rust_gradium::TTS_ENDPOINT.to_string());
-
-    let voice_id = std::env::var("GRADIUM_VOICE_ID")
+    let tts_voice_id = std::env::var("GRADIUM_TTS_VOICE_ID")
         .unwrap_or_else(|_| rust_gradium::DEFAULT_VOICE_ID.to_string());
+
 
     let llm_api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("LLM_API_KEY"))
@@ -43,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let llm_endpoint = std::env::var("LLM_ENDPOINT")
         .unwrap_or_else(|_| llm::endpoints::OPENAI.to_string());
 
-    let system_prompt = std::env::var("SYSTEM_PROMPT")
+    let llm_system_prompt = std::env::var("LLM_SYSTEM_PROMPT")
         .unwrap_or_else(|_| "You are a helpful voice assistant. Keep your responses concise and conversational.".to_string());
 
     let config = Config {
@@ -51,11 +55,12 @@ async fn main() -> anyhow::Result<()> {
         tts_endpoint: tts_endpoint,
         stt_endpoint: stt_endpoint,
         stt_api_key: gradium_api_key,
-        voice_id: voice_id,
-        llm_api_key,
-        llm_model,
-        llm_endpoint,
-        system_prompt,
+        stt_language: stt_language,
+        tts_voice_id: tts_voice_id,
+        llm_api_key: llm_api_key,
+        llm_model: llm_model,
+        llm_endpoint: llm_endpoint,
+        llm_system_prompt: llm_system_prompt,
     };
 
     let mut agent = VoiceAgent::new(config);
