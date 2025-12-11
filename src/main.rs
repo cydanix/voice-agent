@@ -4,7 +4,6 @@ mod pcm_playback;
 mod stt_handle;
 mod tts_handle;
 mod voice_agent;
-mod pause_detector;
 
 use tracing::{debug, error, info};
 use voice_agent::{VoiceAgent, Config};

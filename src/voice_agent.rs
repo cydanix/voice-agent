@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::Mutex;
 use tracing::{info, error, debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
@@ -15,7 +14,7 @@ use crate::pcm_capture::PcmCapture;
 use crate::pcm_playback::{PcmPlayback, PcmPlaybackController};
 use crate::stt_handle::SttHandle;
 use crate::tts_handle::TtsHandle;
-use crate::pause_detector::PauseDetector;
+use std::time::Instant;
 
 pub struct VoiceAgent {
     config: Config,
@@ -25,7 +24,6 @@ pub struct VoiceAgent {
     capture: Option<PcmCapture>,
     playback: Option<PcmPlayback>,
     wg: WaitGroup,
-    pause_detector: Arc<Mutex<PauseDetector>>,
 }
 
 pub struct Config {
@@ -44,6 +42,8 @@ pub struct Config {
 enum VoiceAgentEvent {
     UserInput(String),
     UserBreak(String),
+    TtsError(String),
+    SttError(String),
     TtsCloseOrEos,
     SttCloseOrEos,
     Error,
@@ -62,7 +62,6 @@ impl VoiceAgent {
             capture: None,
             playback: None,
             wg: WaitGroup::new(),
-            pause_detector: Arc::new(Mutex::new(PauseDetector::new())),
         }
     }
 
@@ -310,8 +309,6 @@ impl VoiceAgent {
         });
     }
 
-    /// 80ms of 24kHz mono PCM = 1920 samples = 3840 bytes
-    const STT_CHUNK_BYTES: usize = 3840;
 
     fn spawn_stt_sender_task(
         &self,
@@ -335,8 +332,8 @@ impl VoiceAgent {
                     buffer.extend(bytes);
 
                     // Send complete 80ms chunks to STT
-                    while buffer.len() >= Self::STT_CHUNK_BYTES {
-                        let chunk: Vec<u8> = buffer.drain(..Self::STT_CHUNK_BYTES).collect();
+                    while buffer.len() >= SttHandle::STT_CHUNK_BYTES {
+                        let chunk: Vec<u8> = buffer.drain(..SttHandle::STT_CHUNK_BYTES).collect();
                         let b64 = BASE64.encode(&chunk);
 
                         chunks_sent += 1;
@@ -369,13 +366,13 @@ impl VoiceAgent {
     }
 
     const VAD_INDEX_TO_CHECK: usize = 2;
-    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, stt_bytes_tx: UnboundedSender<Vec<u8>>, event_tx: UnboundedSender<VoiceAgentEvent>) {
-        let pause_detector = self.pause_detector.clone();
+    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, _stt_bytes_tx: UnboundedSender<Vec<u8>>, event_tx: UnboundedSender<VoiceAgentEvent>) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
             let mut pending_text = String::new();
             let mut flushed = false;
+            let mut flush_ts = Instant::now();
             loop {
                 debug!("STT event loop");
                 if stt.is_reconnecting() {
@@ -396,25 +393,20 @@ impl VoiceAgent {
                                 if vad.len() > Self::VAD_INDEX_TO_CHECK {
                                     inactivity_prob = vad[Self::VAD_INDEX_TO_CHECK].inactivity_prob;
                                 }
+                                info!("inactivity_prob: {inactivity_prob}");
 
-                                let mut pd = pause_detector.lock().await;
-                                pd.add_inactivity_prob(inactivity_prob);
-
-
-                                // flush STT by silence
-                                if !pending_text.is_empty() && pd.is_in_high_inactivity() && !pd.is_paused() && !flushed {
+                                if !pending_text.is_empty() && inactivity_prob > 0.6 && !flushed {
                                     info!("Flushing STT by silence");
-                                    let silent_chunk_bytes = vec![0u8; 14 * Self::STT_CHUNK_BYTES];
-                                    if let Err(e) = stt_bytes_tx.send(silent_chunk_bytes) {
-                                        error!("Failed to send silent chunk to STT: {e}");
-                                        break;
+                                    if let Err(e) = stt.flush_by_silence().await {
+                                        warn!("Failed to flush STT by silence: {e}");
+                                    } else {
+                                        info!("STT flushed by silence");
                                     }
-                                    info!("STT flushed by silence");
                                     flushed = true;
-                                    pd.on_flush();
+                                    flush_ts = Instant::now();
                                 }
 
-                                if !pending_text.is_empty() && pd.is_paused() {
+                                if !pending_text.is_empty() && flushed && flush_ts.elapsed().as_millis() > 600 {
                                     let user_input = pending_text.to_string();
                                     pending_text.clear();
 
@@ -425,7 +417,6 @@ impl VoiceAgent {
                                         warn!("Failed to send to LLM task: {e}");
                                     }
 
-                                    pd.reset();
                                     flushed = false;
                                 }
                             }
@@ -440,16 +431,20 @@ impl VoiceAgent {
                                         warn!("Failed to send to UserBreak event: {e}");
                                     }
                                 }
-                                pause_detector.lock().await.add_text(&trimmed_text);
                             }
                             SttEvent::EndText { stop } => {
                                 debug!("STT end text at {stop:.2}s");
                             }
-                            SttEvent::Ready { request_id, model_name, sample_rate } => {
-                                info!("STT ready: request_id={request_id}, model={model_name}, sample_rate={sample_rate}");
+                            SttEvent::Ready { request_id, model_name, sample_rate, frame_size, delay_in_frames } => {
+                                info!("STT ready: request_id={request_id}, model={model_name}, sample_rate={sample_rate}, frame_size={frame_size}, delay_in_frames={delay_in_frames}");
                             }
                             SttEvent::Error { message, code } => {
                                 error!("STT error: {message} (code: {code})");
+
+                                stt.set_reconnecting();
+                                if let Err(e) = event_tx.send(VoiceAgentEvent::SttError(format!("STT error: {message} (code: {code})"))) {
+                                    warn!("Failed to send to SttError event: {e}");
+                                }
                             }
                             SttEvent::EndOfStream|SttEvent::Close => {
                                 info!("STT end of stream or connection closed, event: {event:?}");
@@ -472,11 +467,17 @@ impl VoiceAgent {
                     }
                     Ok(None) => {
                         error!("STT client not connected");
-                        break;
+                        stt.set_reconnecting();
+                        if let Err(e) = event_tx.send(VoiceAgentEvent::SttError("STT client not connected".to_string())) {
+                            warn!("Failed to send to SttError event: {e}");
+                        }
                     }
                     Err(e) => {
                         error!("STT event error: {e}");
-                        break;
+                        stt.set_reconnecting();
+                        if let Err(e) = event_tx.send(VoiceAgentEvent::SttError(format!("STT event error: {e}"))) {
+                            warn!("Failed to send to SttError event: {e}");
+                        }
                     }
                 }
             }
@@ -608,10 +609,11 @@ impl VoiceAgent {
                             }
                             TtsEvent::Error { message, code } => {
                                 error!("TTS error: {message} (code: {code})");
-                                if let Err(e) = event_tx.send(VoiceAgentEvent::Error) {
-                                    warn!("Failed to send to Error event: {e}");
+
+                                tts.set_reconnecting();
+                                if let Err(e) = event_tx.send(VoiceAgentEvent::TtsError(message)) {
+                                    warn!("Failed to send to TtsError event: {e}");
                                 }
-                                break;
                             }
                             TtsEvent::EndOfStream|TtsEvent::Close => {
                                 info!("TTS end of stream or connection closed, event: {event:?}");
@@ -634,17 +636,17 @@ impl VoiceAgent {
                     }
                     Ok(None) => {
                         error!("TTS client not connected");
-                        if let Err(e) = event_tx.send(VoiceAgentEvent::Error) {
-                            warn!("Failed to send to Error event: {e}");
+                        tts.set_reconnecting();
+                        if let Err(e) = event_tx.send(VoiceAgentEvent::TtsError("TTS client not connected".to_string())) {
+                            warn!("Failed to send to TtsError event: {e}");
                         }
-                        break;
                     }
                     Err(e) => {
                         error!("TTS event error: {e}");
-                        if let Err(e) = event_tx.send(VoiceAgentEvent::Error) {
-                            warn!("Failed to send to Error event: {e}");
+                        tts.set_reconnecting();
+                        if let Err(e) = event_tx.send(VoiceAgentEvent::TtsError(e.to_string())) {
+                            warn!("Failed to send to TtsError event: {e}");
                         }
-                        break;
                     }
                 }
             }
@@ -690,7 +692,22 @@ impl VoiceAgent {
                                 info!("User break complete");
                             }
                             VoiceAgentEvent::TtsCloseOrEos => {
-                                info!("TTS close or EOS");
+                                info!("TTS close or eos");
+                                if tts.is_final_shutdown() {
+                                    info!("TTS final shutdown");
+                                    break;
+                                }
+                                if let Err(e) = tts.reconnect().await {
+                                    error!("TTS reconnect error: {e}");
+                                    break;
+                                }
+                                if tts.is_final_shutdown() {
+                                    info!("TTS final shutdown after reconnect");
+                                    break;
+                                }
+                            }
+                            VoiceAgentEvent::TtsError(message) => {
+                                info!("TTS error: {message}");
                                 if tts.is_final_shutdown() {
                                     info!("TTS final shutdown");
                                     break;
@@ -706,6 +723,21 @@ impl VoiceAgent {
                             }
                             VoiceAgentEvent::SttCloseOrEos => {
                                 info!("STT close or eos");
+                                if stt.is_final_shutdown() {
+                                    info!("STT final shutdown");
+                                    break;
+                                }
+                                if let Err(e) = stt.reconnect().await {
+                                    error!("STT reconnect error: {e}");
+                                    break;
+                                }
+                                if stt.is_final_shutdown() {
+                                    info!("STT final shutdown after reconnect");
+                                    break;
+                                }
+                            }
+                            VoiceAgentEvent::SttError(message) => {
+                                info!("STT error: {message}");
                                 if stt.is_final_shutdown() {
                                     info!("STT final shutdown");
                                     break;

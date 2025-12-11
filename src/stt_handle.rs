@@ -26,6 +26,8 @@ pub struct SttHandle {
 
 impl SttHandle {
     const MAX_AUDIO_QUEUE_SIZE: usize = 64;
+    /// 80ms of 24kHz mono PCM = 1920 samples = 3840 bytes
+    pub const STT_CHUNK_BYTES: usize = 3840;
 
     pub fn new(config: SttConfig) -> Self {
         Self {
@@ -103,6 +105,18 @@ impl SttHandle {
         self.enqueue(audio).await?;
         self.process_queue().await?;
         Ok(())
+    }
+
+    pub async fn flush_by_silence(&self) -> anyhow::Result<()> {
+        if let Some(ref client) = *self.client.read().await {
+            if let Err(e) = client.send_silence().await {
+                error!("STT send silence error: {e}");
+                return Err(e.into());
+            }
+            Ok(())
+        } else {
+            Err(SttHandleError::NotConnected.into())
+        }
     }
 
     pub async fn next_event(&self) -> anyhow::Result<Option<SttEvent>> {
