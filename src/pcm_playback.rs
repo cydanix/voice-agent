@@ -7,34 +7,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, debug, info};
 
-/// A Send-safe handle for controlling playback from async tasks
-#[derive(Clone)]
-pub struct PcmPlaybackController {
-    queue: Arc<Mutex<VecDeque<i16>>>,
-    stopped: Arc<AtomicBool>,
-}
-
-impl PcmPlaybackController {
-    /// Clear pending audio and resume playback (e.g., when user interrupts)
-    pub fn restart(&self) -> Result<()> {
-        if let Ok(mut buf) = self.queue.lock() {
-            buf.clear();
-        }
-        self.stopped.store(false, Ordering::Relaxed);
-        info!("playback restarted");
-        Ok(())
-    }
+pub enum PcmPlaybackMessage {
+    Play(Vec<i16>),
+    Reset,
 }
 
 pub struct PcmPlayback {
     stream: cpal::Stream,
     queue: Arc<Mutex<VecDeque<i16>>>,
     stopped: Arc<AtomicBool>,
-    controller: PcmPlaybackController,
 }
 
 impl PcmPlayback {
-    pub fn new(mut rx: UnboundedReceiver<Vec<i16>>) -> Result<Self> {
+    pub fn new(mut rx: UnboundedReceiver<PcmPlaybackMessage>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(anyhow::anyhow!("no output device"))?;
 
@@ -47,38 +32,48 @@ impl PcmPlayback {
         let queue = Arc::new(Mutex::new(VecDeque::<i16>::new()));
         let stopped = Arc::new(AtomicBool::new(false));
 
-        let q_consumer = Arc::clone(&queue);
-        let stopped_consumer = Arc::clone(&stopped);
+        let queue_clone = Arc::clone(&queue);
+        let stopped_clone = Arc::clone(&stopped);
 
         // background async consumer
         tokio::spawn(async move {
             debug!("playback consumer task started");
-            while let Some(chunk) = rx.recv().await {
-                if stopped_consumer.load(Ordering::Relaxed) {
-                    break;
+            while let Some(message) = rx.recv().await {
+                if stopped_clone.load(Ordering::Relaxed) {
+                    continue;
                 }
-                match q_consumer.lock() {
-                    Ok(mut buf) => buf.extend(chunk),
-                    Err(e) => error!("failed to lock playback queue: {e}"),
+                match message {
+                    PcmPlaybackMessage::Play(chunk) => {
+                        match queue_clone.lock() {
+                            Ok(mut buf) => buf.extend(chunk),
+                            Err(e) => error!("failed to lock playback queue: {e}"),
+                        }
+                    }
+                    PcmPlaybackMessage::Reset => {
+                        match queue_clone.lock() {
+                            Ok(mut buf) => buf.clear(),
+                            Err(e) => error!("failed to lock playback queue: {e}"),
+                        }
+                    }
                 }
             }
             info!("playback consumer task ended");
         });
 
-        let q_callback = Arc::clone(&queue);
-        let stopped_callback = Arc::clone(&stopped);
+        let queue_clone2 = Arc::clone(&queue);
+        let stopped_clone2 = Arc::clone(&stopped);
 
         debug!("building output stream with config: {:?}", config);
         let stream = device.build_output_stream(
             &config,
             move |out: &mut [i16], _| {
-                if stopped_callback.load(Ordering::Relaxed) {
+                if stopped_clone2.load(Ordering::Relaxed) {
                     for s in out {
                         *s = 0;
                     }
                     return;
                 }
-                match q_callback.lock() {
+                match queue_clone2.lock() {
                     Ok(mut buf) => {
                         for s in out {
                             *s = buf.pop_front().unwrap_or(0);
@@ -91,17 +86,8 @@ impl PcmPlayback {
             None,
         )?;
 
-        let controller = PcmPlaybackController {
-            queue: Arc::clone(&queue),
-            stopped: Arc::clone(&stopped),
-        };
 
-        Ok(Self { stream, queue, stopped, controller })
-    }
-
-    /// Get a Send-safe controller for this playback
-    pub fn controller(&self) -> PcmPlaybackController {
-        self.controller.clone()
+        Ok(Self { stream, queue, stopped })
     }
 
     pub fn start(&self) -> Result<()> {

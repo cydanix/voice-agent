@@ -10,8 +10,8 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, error, debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
-use crate::pcm_capture::PcmCapture;
-use crate::pcm_playback::{PcmPlayback, PcmPlaybackController};
+use crate::pcm_capture::{PcmCapture, PcmCaptureMessage};
+use crate::pcm_playback::{PcmPlayback, PcmPlaybackMessage};
 use crate::stt_handle::SttHandle;
 use crate::tts_handle::TtsHandle;
 use std::time::Instant;
@@ -71,8 +71,8 @@ impl VoiceAgent {
     /// Start the voice agent - connects to STT/TTS and starts audio processing
     pub async fn start(&mut self) -> anyhow::Result<()> {
         // Create channels
-        let (capture_tx, capture_rx) = unbounded_channel::<Vec<i16>>();
-        let (playback_tx, playback_rx) = unbounded_channel::<Vec<i16>>();
+        let (capture_tx, capture_rx) = unbounded_channel::<PcmCaptureMessage>();
+        let (playback_tx, playback_rx) = unbounded_channel::<PcmPlaybackMessage>();
         let (event_tx, event_rx) = unbounded_channel::<VoiceAgentEvent>();
 
         // Create STT handle
@@ -135,7 +135,6 @@ impl VoiceAgent {
                 return Err(e);
             }
         };
-        let playback_controller = playback.controller();
 
         // Start audio streams
         if let Err(e) = capture.start() {
@@ -162,8 +161,8 @@ impl VoiceAgent {
         self.spawn_capture_task(capture_rx, Arc::clone(&stt));
         self.spawn_stt_event_task(Arc::clone(&stt), event_tx.clone());
         self.spawn_llm_task(Arc::clone(&llm), Arc::clone(&tts), llm_input_rx, event_tx.clone());
-        self.spawn_tts_event_task(Arc::clone(&tts), playback_tx, event_tx.clone());
-        self.spawn_main_loop_task(Arc::clone(&stt), Arc::clone(&tts), Arc::clone(&llm), playback_controller, event_rx, llm_input_tx);
+        self.spawn_tts_event_task(Arc::clone(&tts), playback_tx.clone(), event_tx.clone());
+        self.spawn_main_loop_task(Arc::clone(&stt), Arc::clone(&tts), Arc::clone(&llm), playback_tx, event_rx, llm_input_tx);
 
         // Store handles
         self.stt = Some(stt);
@@ -296,7 +295,7 @@ impl VoiceAgent {
 
     fn spawn_capture_task(
         &self,
-        mut capture_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
+        mut capture_rx: tokio::sync::mpsc::UnboundedReceiver<PcmCaptureMessage>,
         stt: Arc<SttHandle>
     ) {
         let wg_guard = self.wg.add();
@@ -312,7 +311,11 @@ impl VoiceAgent {
                     break;
                 }
                 // PcmCapture now outputs 24kHz samples directly
-                if let Some(pcm_24k) = capture_rx.recv().await {
+                if let Some(msg) = capture_rx.recv().await {
+                    let pcm_24k = match msg {
+                        PcmCaptureMessage::Chunk(pcm_24k) => pcm_24k,
+                    };
+
                     // Log periodically
                     audio_chunks_sent += 1;
                     if audio_chunks_sent % 100 == 1 {
@@ -550,7 +553,7 @@ impl VoiceAgent {
         });
     }
 
-    fn spawn_tts_event_task(&self, tts: Arc<TtsHandle>, playback_tx: UnboundedSender<Vec<i16>>, event_tx: UnboundedSender<VoiceAgentEvent>) {
+    fn spawn_tts_event_task(&self, tts: Arc<TtsHandle>, playback_tx: UnboundedSender<PcmPlaybackMessage>, event_tx: UnboundedSender<VoiceAgentEvent>) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
@@ -582,7 +585,7 @@ impl VoiceAgent {
                                             .collect();
 
                                         debug!("TTS audio: {} samples", samples.len());
-                                        if let Err(e) = playback_tx.send(samples) {
+                                        if let Err(e) = playback_tx.send(PcmPlaybackMessage::Play(samples)) {
                                             warn!("playback send error: {e}");
                                         }
                                     }
@@ -650,7 +653,7 @@ impl VoiceAgent {
         stt: Arc<SttHandle>,
         tts: Arc<TtsHandle>,
         llm: Arc<LlmClient>,
-        playback_controller: PcmPlaybackController,
+        playback_tx: UnboundedSender<PcmPlaybackMessage>,
         mut event_rx: tokio::sync::mpsc::UnboundedReceiver<VoiceAgentEvent>,
         llm_input_tx: UnboundedSender<String>,
     ) {
@@ -675,8 +678,8 @@ impl VoiceAgent {
                                     error!("Failed to cancel TTS: {e}");
                                     break;
                                 }
-                                if let Err(e) = playback_controller.restart() {
-                                    error!("Failed to start playback: {e}");
+                                if let Err(e) = playback_tx.send(PcmPlaybackMessage::Reset) {
+                                    error!("Failed to send to playback task: {e}");
                                     break;
                                 }
                                 info!("User break complete");
