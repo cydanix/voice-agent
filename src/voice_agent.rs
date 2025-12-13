@@ -25,6 +25,7 @@ pub struct VoiceAgent {
     event_tx: Option<UnboundedSender<VoiceAgentEvent>>,
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub stt_api_key: String,
     pub stt_endpoint: String,

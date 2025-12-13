@@ -1,14 +1,7 @@
-mod llm;
-mod pcm_capture;
-mod pcm_playback;
-mod stt_handle;
-mod tts_handle;
-mod voice_agent;
-
 use tracing::{debug, error, info};
-use voice_agent::{VoiceAgent, Config};
-use pcm_capture::{PcmCapture, PcmCaptureMessage};
-use pcm_playback::{PcmPlayback, PcmPlaybackMessage};
+use voice_agent::voice_agent::{VoiceAgent, Config};
+use voice_agent::pcm_capture::{PcmCapture, PcmCaptureMessage};
+use voice_agent::pcm_playback::{PcmPlayback, PcmPlaybackMessage};
 use tokio::sync::mpsc::unbounded_channel;
 
 #[tokio::main]
@@ -47,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
     let llm_endpoint = std::env::var("LLM_ENDPOINT")
-        .unwrap_or_else(|_| llm::endpoints::OPENAI.to_string());
+        .unwrap_or_else(|_| voice_agent::llm::endpoints::OPENAI.to_string());
 
     let llm_system_prompt = std::env::var("LLM_SYSTEM_PROMPT")
         .unwrap_or_else(|_| "You are a helpful voice assistant. Keep your responses concise and conversational.".to_string());
