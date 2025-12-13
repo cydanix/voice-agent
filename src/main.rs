@@ -96,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
     let mut agent = VoiceAgent::new(config);
     if let Err(e) = agent.start(capture_rx, playback_tx).await {
         error!("error starting voice agent: {e}");
+        capture.stop();
+        playback.stop();
         return Err(e);
     }
     info!("voice agent started");
