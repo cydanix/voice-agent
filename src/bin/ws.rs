@@ -36,6 +36,8 @@ enum WebSocketResponse {
     Error { message: String },
     #[serde(rename = "pong")]
     Pong,
+    #[serde(rename = "reset")]
+    Reset,
 }
 
 /// WebSocket connection handler
@@ -79,6 +81,9 @@ impl Actor for WebSocketSession {
                         }
                         PcmPlaybackMessage::Reset => {
                             debug!("Playback reset requested");
+                            // Send reset message to WebSocket client
+                            let msg = serde_json::to_string(&WebSocketResponse::Reset).unwrap();
+                            addr.do_send(PlaybackMessage(msg));
                         }
                     }
                 }

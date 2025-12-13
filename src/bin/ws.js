@@ -7,11 +7,14 @@ let sourceNode = null;
 let processorNode = null;
 let playbackContext = null;
 let playbackSource = null;
+let nextPlayTime = 0;
+let activeSources = [];
 
 // Audio configuration
-const SAMPLE_RATE = 16000; // 16kHz sample rate
+const INPUT_SAMPLE_RATE = 24000; // 24kHz sample rate
+const OUTPUT_SAMPLE_RATE = 48000; // 48kHz sample rate
 const CHANNELS = 1; // Mono
-const BUFFER_SIZE = 4096;
+const BUFFER_SIZE = 2048;
 
 // DOM elements
 const connectBtn = document.getElementById('connectBtn');
@@ -102,6 +105,9 @@ function handleMessage(data) {
             showError(`Server error: ${message.message}`);
         } else if (message.type === 'pong') {
             // Heartbeat response, no action needed
+        } else if (message.type === 'reset') {
+            // Reset playback state
+            resetPlayback();
         }
     } catch (error) {
         // If not JSON, might be binary or other format
@@ -126,28 +132,68 @@ function base64ToPCM(base64) {
     return samples;
 }
 
+// Reset playback state
+function resetPlayback() {
+    // Stop all active audio sources
+    activeSources.forEach(source => {
+        try {
+            source.stop();
+        } catch (e) {
+            // Source may already be stopped, ignore error
+        }
+    });
+    activeSources = [];
+    
+    // Reset the next play time to slightly in the future to ensure clean start
+    // Add a small buffer (50ms) to allow reset to fully process
+    if (playbackContext) {
+        nextPlayTime = playbackContext.currentTime + 0.05; // 50ms buffer
+    } else {
+        // If context doesn't exist yet, it will be initialized in playAudio
+        nextPlayTime = 0;
+    }
+}
+
 // Play PCM audio data
 function playAudio(pcmData) {
     if (!playbackContext) {
-        playbackContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        playbackContext = new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
+        nextPlayTime = playbackContext.currentTime;
     }
 
     // Convert Int16Array to Float32Array for Web Audio API
     const float32Data = new Float32Array(pcmData.length);
     for (let i = 0; i < pcmData.length; i++) {
         // Convert from i16 range (-32768 to 32767) to float range (-1.0 to 1.0)
-        float32Data[i] = pcmData[i] / 32768.0;
+        // Use 32768.0 to properly handle -32768
+        const sample = pcmData[i];
+        float32Data[i] = sample === -32768 ? -1.0 : sample / 32768.0;
     }
 
     // Create audio buffer
-    const buffer = playbackContext.createBuffer(CHANNELS, float32Data.length, SAMPLE_RATE);
+    const buffer = playbackContext.createBuffer(CHANNELS, float32Data.length, OUTPUT_SAMPLE_RATE);
     buffer.copyToChannel(float32Data, 0);
 
-    // Create and play source
+    // Schedule playback to avoid gaps
     const source = playbackContext.createBufferSource();
     source.buffer = buffer;
     source.connect(playbackContext.destination);
-    source.start();
+    
+    // Track active sources for reset functionality
+    activeSources.push(source);
+    
+    // Remove source from active list when it finishes
+    source.onended = () => {
+        const index = activeSources.indexOf(source);
+        if (index > -1) {
+            activeSources.splice(index, 1);
+        }
+    };
+    
+    // Calculate duration and schedule next chunk
+    const duration = buffer.duration;
+    source.start(nextPlayTime);
+    nextPlayTime += duration;
 }
 
 // Start recording audio from microphone
@@ -159,14 +205,14 @@ async function startRecording() {
         mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 channelCount: CHANNELS,
-                sampleRate: SAMPLE_RATE,
+                sampleRate: INPUT_SAMPLE_RATE,
                 echoCancellation: true,
                 noiseSuppression: true,
             }
         });
 
         // Create audio context
-        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        audioContext = new AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
         
         // Create source from microphone
         sourceNode = audioContext.createMediaStreamSource(mediaStream);

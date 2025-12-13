@@ -205,7 +205,7 @@ impl VoiceAgent {
                     break;
                 }
 
-                info!("STT sendingping");
+                info!("STT sending ping");
                 if let Err(e) = stt.send_ping().await {
                     warn!("STT ping error: {e}");
                 }
@@ -601,12 +601,15 @@ impl VoiceAgent {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
+            let mut is_new_llm_response = false;
             loop {
                 match event_rx.recv().await {
                     Some(event) => {
                         match event {
                             VoiceAgentEvent::UserInput(input) => {
                                 info!("User input: '{}'", input);
+                                // Mark that a new LLM response is starting
+                                is_new_llm_response = true;
                                 if let Err(e) = llm_input_tx.send(input) {
                                     error!("Failed to send to LLM task: {e}");
                                     break;
@@ -623,6 +626,7 @@ impl VoiceAgent {
                                     error!("Failed to send to playback task: {e}");
                                     break;
                                 }
+                                is_new_llm_response = false;
                                 info!("User break complete");
                             }
                             VoiceAgentEvent::TtsCloseOrEos => {
@@ -659,6 +663,17 @@ impl VoiceAgent {
                             }
                             VoiceAgentEvent::LlmResponseChunk(text) => {
                                 info!("LLM response chunk: '{}'", text);
+                                // Reset playback before first chunk of new LLM response
+                                if is_new_llm_response {
+                                    info!("Resetting playback for new LLM response");
+                                    if let Err(e) = playback_tx.send(PcmPlaybackMessage::Reset) {
+                                        error!("Failed to send reset to playback task: {e}");
+                                        break;
+                                    }
+                                    // Small delay to ensure reset is processed
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    is_new_llm_response = false;
+                                }
                                 if let Err(e) = tts.process(&text).await {
                                     error!("TTS process error: {e}");
                                     break;
@@ -666,6 +681,17 @@ impl VoiceAgent {
                             }
                             VoiceAgentEvent::LlmResponseDone(text) => {
                                 info!("LLM response done: '{}'", text);
+                                // Reset playback before first chunk if this is the first (and only) chunk
+                                if is_new_llm_response {
+                                    info!("Resetting playback for new LLM response (done)");
+                                    if let Err(e) = playback_tx.send(PcmPlaybackMessage::Reset) {
+                                        error!("Failed to send reset to playback task: {e}");
+                                        break;
+                                    }
+                                    // Small delay to ensure reset is processed
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    is_new_llm_response = false;
+                                }
                                 if !text.is_empty() {
                                     if let Err(e) = tts.process(&text).await {
                                         error!("TTS process error: {e}");
