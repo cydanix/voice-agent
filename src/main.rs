@@ -7,6 +7,9 @@ mod voice_agent;
 
 use tracing::{debug, error, info};
 use voice_agent::{VoiceAgent, Config};
+use pcm_capture::{PcmCapture, PcmCaptureMessage};
+use pcm_playback::{PcmPlayback, PcmPlaybackMessage};
+use tokio::sync::mpsc::unbounded_channel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,8 +65,36 @@ async fn main() -> anyhow::Result<()> {
         llm_system_prompt: llm_system_prompt,
     };
 
+    let (capture_tx, capture_rx) = unbounded_channel::<PcmCaptureMessage>();
+    let (playback_tx, playback_rx) = unbounded_channel::<PcmPlaybackMessage>();
+
+    let capture = match PcmCapture::new(capture_tx) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to create PcmCapture: {e}");
+            return Err(e);
+        }
+    };
+    let playback = match PcmPlayback::new(playback_rx) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("failed to create PcmPlayback: {e}");
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = capture.start() {
+        error!("failed to start capture: {e}");
+        return Err(e);
+    }
+    if let Err(e) = playback.start() {
+        error!("failed to start playback: {e}");
+        capture.stop();
+        return Err(e);
+    }
+
     let mut agent = VoiceAgent::new(config);
-    if let Err(e) = agent.start().await {
+    if let Err(e) = agent.start(capture_rx, playback_tx).await {
         error!("error starting voice agent: {e}");
         return Err(e);
     }
@@ -72,10 +103,14 @@ async fn main() -> anyhow::Result<()> {
     match agent.run().await {
         Ok(_) => {
             info!("run completed successfully");
+            capture.stop();
+            playback.stop();
             agent.shutdown().await;
         }
         Err(e) => {
             error!("error running voice agent: {e}");
+            capture.stop();
+            playback.stop();
             agent.shutdown().await;
         }
     }

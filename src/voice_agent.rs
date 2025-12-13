@@ -5,13 +5,13 @@ use rust_gradium::wg::WaitGroup;
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, error, debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
-use crate::pcm_capture::{PcmCapture, PcmCaptureMessage};
-use crate::pcm_playback::{PcmPlayback, PcmPlaybackMessage};
+use crate::pcm_capture::PcmCaptureMessage;
+use crate::pcm_playback::PcmPlaybackMessage;
 use crate::stt_handle::SttHandle;
 use crate::tts_handle::TtsHandle;
 use std::time::Instant;
@@ -21,8 +21,6 @@ pub struct VoiceAgent {
     stt: Option<Arc<SttHandle>>,
     tts: Option<Arc<TtsHandle>>,
     llm: Option<Arc<LlmClient>>,
-    capture: Option<PcmCapture>,
-    playback: Option<PcmPlayback>,
     wg: WaitGroup,
     event_tx: Option<UnboundedSender<VoiceAgentEvent>>,
 }
@@ -61,18 +59,14 @@ impl VoiceAgent {
             stt: None,
             tts: None,
             llm: None,
-            capture: None,
-            playback: None,
             wg: WaitGroup::new(),
             event_tx: None,
         }
     }
 
     /// Start the voice agent - connects to STT/TTS and starts audio processing
-    pub async fn start(&mut self) -> anyhow::Result<()> {
+    pub async fn start(&mut self, capture_rx: UnboundedReceiver<PcmCaptureMessage>, playback_tx: UnboundedSender<PcmPlaybackMessage>) -> anyhow::Result<()> {
         // Create channels
-        let (capture_tx, capture_rx) = unbounded_channel::<PcmCaptureMessage>();
-        let (playback_tx, playback_rx) = unbounded_channel::<PcmPlaybackMessage>();
         let (event_tx, event_rx) = unbounded_channel::<VoiceAgentEvent>();
 
         // Create STT handle
@@ -114,44 +108,6 @@ impl VoiceAgent {
         }
         info!("TTS connected");
 
-        // Create audio capture
-        let capture = match PcmCapture::new(capture_tx) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("failed to create PcmCapture: {e}");
-                tts.shutdown().await;
-                stt.shutdown().await;
-                return Err(e);
-            }
-        };
-
-        // Create audio playback
-        let playback = match PcmPlayback::new(playback_rx) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("failed to create PcmPlayback: {e}");
-                tts.shutdown().await;
-                stt.shutdown().await;
-                return Err(e);
-            }
-        };
-
-        // Start audio streams
-        if let Err(e) = capture.start() {
-            error!("failed to start capture: {e}");
-            tts.shutdown().await;
-            stt.shutdown().await;
-            return Err(e);
-        }
-
-        if let Err(e) = playback.start() {
-            error!("failed to start playback: {e}");
-            capture.stop();
-            tts.shutdown().await;
-            stt.shutdown().await;
-            return Err(e);
-        }
-
         // Create channel for user input to LLM
         let (llm_input_tx, llm_input_rx) = unbounded_channel::<String>();
 
@@ -168,8 +124,6 @@ impl VoiceAgent {
         self.stt = Some(stt);
         self.tts = Some(tts);
         self.llm = Some(llm);
-        self.capture = Some(capture);
-        self.playback = Some(playback);
         self.event_tx = Some(event_tx);
 
         info!("voice agent started");
@@ -209,12 +163,6 @@ impl VoiceAgent {
             tts.set_final_shutdown();
         }
 
-        // Stop audio capture (fast, non-blocking)
-        if let Some(ref capture) = self.capture {
-            info!("stopping audio capture");
-            capture.stop();
-        }
-
         if let Some(ref stt) = self.stt {
             info!("shutting down STT");
             stt.shutdown().await;
@@ -223,14 +171,6 @@ impl VoiceAgent {
         if let Some(ref tts) = self.tts {
             info!("shutting down TTS");
             tts.shutdown().await;
-        }
-
-        // Close channels to signal tasks to stop (after shutdowns are in progress)
-        info!("closing channels");
-        // Stop audio playback (after closing playback_tx)
-        if let Some(ref playback) = self.playback {
-            info!("stopping audio playback");
-            playback.stop();
         }
 
         // Signal shutdown to all tasks
