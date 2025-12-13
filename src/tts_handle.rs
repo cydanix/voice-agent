@@ -155,7 +155,7 @@ impl TtsHandle {
                         if self.is_final_shutdown() {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        tokio::time::sleep(Duration::from_millis(40)).await;
                     }
                 } => {
                     Err(TtsHandleError::FinalShutdown.into())
