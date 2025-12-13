@@ -2550,6 +2550,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "futures-util",
+ "once_cell",
  "reqwest",
  "rust-gradium",
  "serde",

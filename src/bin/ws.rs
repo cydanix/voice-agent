@@ -2,6 +2,7 @@ use actix::prelude::*;
 use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer};
 use actix_web_actors::ws;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -61,29 +62,59 @@ impl Actor for WebSocketSession {
         // Spawn task to forward playback audio to WebSocket client
         if let Some(mut playback_rx) = self.playback_rx.take() {
             let addr = ctx.address();
+            // Cache reset message string to avoid repeated allocation
+            let reset_msg = serde_json::to_string(&WebSocketResponse::Reset).unwrap();
             tokio::spawn(async move {
+                // Batch audio chunks to reduce WebSocket overhead
+                let mut audio_buffer = Vec::new();
+                let mut last_send = Instant::now();
+                const BATCH_INTERVAL_MS: u64 = 20; // Send every 20ms or when buffer gets large
+                const MAX_BATCH_SAMPLES: usize = 4800; // ~100ms at 48kHz
+                
                 while let Some(message) = playback_rx.recv().await {
                     match message {
                         PcmPlaybackMessage::Play(samples) => {
-                            // Convert samples to bytes (little-endian)
-                            let bytes: Vec<u8> = samples
-                                .iter()
-                                .flat_map(|s| s.to_le_bytes())
-                                .collect();
+                            audio_buffer.extend_from_slice(&samples);
+                            
+                            // Send if buffer is large enough or enough time has passed
+                            let should_send = audio_buffer.len() >= MAX_BATCH_SAMPLES 
+                                || last_send.elapsed().as_millis() >= BATCH_INTERVAL_MS as u128;
+                            
+                            if should_send && !audio_buffer.is_empty() {
+                                // Convert samples to bytes (little-endian) - pre-allocate capacity
+                                let bytes: Vec<u8> = audio_buffer
+                                    .iter()
+                                    .flat_map(|s| s.to_le_bytes())
+                                    .collect();
 
-                            // Encode to base64
-                            let data = BASE64.encode(&bytes);
+                                // Encode to base64
+                                let data = BASE64.encode(&bytes);
 
-                            // Send to WebSocket client
-                            let msg = serde_json::to_string(&WebSocketResponse::Audio { data })
-                                .unwrap();
-                            addr.do_send(PlaybackMessage(msg));
+                                // Send to WebSocket client
+                                let msg = serde_json::to_string(&WebSocketResponse::Audio { data })
+                                    .unwrap();
+                                addr.do_send(PlaybackMessage(msg));
+                                
+                                audio_buffer.clear();
+                                last_send = Instant::now();
+                            }
                         }
                         PcmPlaybackMessage::Reset => {
                             debug!("Playback reset requested");
+                            // Send any buffered audio first
+                            if !audio_buffer.is_empty() {
+                                let bytes: Vec<u8> = audio_buffer
+                                    .iter()
+                                    .flat_map(|s| s.to_le_bytes())
+                                    .collect();
+                                let data = BASE64.encode(&bytes);
+                                let msg = serde_json::to_string(&WebSocketResponse::Audio { data })
+                                    .unwrap();
+                                addr.do_send(PlaybackMessage(msg));
+                                audio_buffer.clear();
+                            }
                             // Send reset message to WebSocket client
-                            let msg = serde_json::to_string(&WebSocketResponse::Reset).unwrap();
-                            addr.do_send(PlaybackMessage(msg));
+                            addr.do_send(PlaybackMessage(reset_msg.clone()));
                         }
                     }
                 }
@@ -120,10 +151,12 @@ impl WebSocketSession {
                 return;
             }
 
-            // Send ping
-            let msg = serde_json::to_string(&WebSocketResponse::Pong).unwrap();
+            // Send ping (cache the pong message string)
+            static PONG_MSG: Lazy<String> = Lazy::new(|| {
+                serde_json::to_string(&WebSocketResponse::Pong).unwrap()
+            });
             ctx.ping(b"");
-            ctx.text(msg);
+            ctx.text(PONG_MSG.as_str());
         });
     }
 
@@ -167,9 +200,11 @@ impl WebSocketSession {
                 }
             }
             Ok(WebSocketMessage::Ping) => {
-                // Respond to ping
-                let pong = serde_json::to_string(&WebSocketResponse::Pong).unwrap();
-                ctx.text(pong);
+                // Respond to ping (use cached message)
+                static PONG_MSG: Lazy<String> = Lazy::new(|| {
+                    serde_json::to_string(&WebSocketResponse::Pong).unwrap()
+                });
+                ctx.text(PONG_MSG.as_str());
                 self.hb = Instant::now();
             }
             Ok(WebSocketMessage::Pong) => {

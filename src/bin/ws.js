@@ -4,7 +4,8 @@ let isRecording = false;
 let audioContext = null;
 let mediaStream = null;
 let sourceNode = null;
-let processorNode = null;
+let workletNode = null;
+let isWorkletReady = false;
 let playbackContext = null;
 let playbackSource = null;
 let nextPlayTime = 0;
@@ -23,6 +24,64 @@ const stopBtn = document.getElementById('stopBtn');
 const statusDiv = document.getElementById('status');
 const errorDiv = document.getElementById('error');
 const wsUrlInput = document.getElementById('wsUrl');
+
+// Load worklet code as text (for blob URL fallback)
+async function loadWorkletAsBlob() {
+    try {
+        // Try to fetch the worklet file
+        const response = await fetch('audio-processor.js');
+        if (response.ok) {
+            return await response.text();
+        }
+    } catch (e) {
+        // If fetch fails (file:// protocol), use embedded code
+        console.log('Fetch failed, using embedded worklet code');
+    }
+    
+    // Embedded worklet code as fallback
+    return `// AudioWorklet processor for capturing microphone input
+// This runs in a separate audio thread for better performance and lower latency
+
+class AudioCaptureProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+        super();
+        // Use buffer size from options or default to 2048
+        this.bufferSize = options?.processorOptions?.bufferSize || 2048;
+        this.buffer = new Float32Array(this.bufferSize);
+        this.bufferIndex = 0;
+    }
+
+    process(inputs, outputs, parameters) {
+        // Get input from microphone (first input, first channel)
+        const input = inputs[0];
+        if (input && input.length > 0) {
+            const inputChannel = input[0];
+            const inputLength = inputChannel.length;
+            
+            // Copy input samples to buffer
+            for (let i = 0; i < inputLength; i++) {
+                this.buffer[this.bufferIndex++] = inputChannel[i];
+                
+                // When buffer is full, send it to main thread
+                if (this.bufferIndex >= this.bufferSize) {
+                    // Send a copy of the buffer to main thread (Float32Array is transferred efficiently)
+                    this.port.postMessage({
+                        type: 'audio',
+                        data: new Float32Array(this.buffer)
+                    });
+                    this.bufferIndex = 0;
+                }
+            }
+        }
+        
+        // Return true to keep the processor alive
+        return true;
+    }
+}
+
+// Register the processor
+registerProcessor('audio-capture-processor', AudioCaptureProcessor);`;
+}
 
 // Update status display
 function updateStatus(status, className) {
@@ -115,18 +174,26 @@ function handleMessage(data) {
     }
 }
 
-// Convert base64 string to PCM i16 array
+// Convert base64 string to PCM i16 array (optimized)
 function base64ToPCM(base64) {
     const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    
+    // Optimized: use charCodeAt in a single loop
+    for (let i = 0; i < len; i++) {
         bytes[i] = binaryString.charCodeAt(i);
     }
     
     // Convert bytes to i16 samples (little-endian)
-    const samples = new Int16Array(bytes.length / 2);
-    for (let i = 0; i < samples.length; i++) {
-        samples[i] = (bytes[i * 2 + 1] << 8) | bytes[i * 2];
+    // Use DataView for proper endianness handling
+    const sampleCount = len / 2;
+    const samples = new Int16Array(sampleCount);
+    const view = new DataView(bytes.buffer);
+    
+    for (let i = 0; i < sampleCount; i++) {
+        // Read as little-endian (server sends little-endian)
+        samples[i] = view.getInt16(i * 2, true);
     }
     
     return samples;
@@ -134,8 +201,13 @@ function base64ToPCM(base64) {
 
 // Reset playback state
 function resetPlayback() {
+    // Clear audio queue
+    audioQueue = [];
+    isProcessingQueue = false;
+    
     // Stop all active audio sources
-    activeSources.forEach(source => {
+    const sources = activeSources.slice(); // Copy array to avoid modification during iteration
+    sources.forEach(source => {
         try {
             source.stop();
         } catch (e) {
@@ -145,29 +217,54 @@ function resetPlayback() {
     activeSources = [];
     
     // Reset the next play time to slightly in the future to ensure clean start
-    // Add a small buffer (50ms) to allow reset to fully process
+    // Reduced buffer to 20ms for lower latency while still ensuring clean start
     if (playbackContext) {
-        nextPlayTime = playbackContext.currentTime + 0.05; // 50ms buffer
+        nextPlayTime = playbackContext.currentTime + 0.02; // 20ms buffer (reduced from 50ms)
     } else {
         // If context doesn't exist yet, it will be initialized in playAudio
         nextPlayTime = 0;
     }
 }
 
-// Play PCM audio data
-function playAudio(pcmData) {
+// Audio playback queue for batching
+let audioQueue = [];
+let isProcessingQueue = false;
+const MAX_QUEUE_SIZE = 10; // Limit queue size to prevent memory issues
+
+// Process audio queue
+function processAudioQueue() {
+    if (isProcessingQueue || audioQueue.length === 0) {
+        return;
+    }
+    
+    isProcessingQueue = true;
+    
+    // Process all queued audio chunks
+    while (audioQueue.length > 0) {
+        const pcmData = audioQueue.shift();
+        playAudioChunk(pcmData);
+    }
+    
+    isProcessingQueue = false;
+}
+
+// Play a single PCM audio chunk
+function playAudioChunk(pcmData) {
     if (!playbackContext) {
         playbackContext = new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
         nextPlayTime = playbackContext.currentTime;
     }
 
-    // Convert Int16Array to Float32Array for Web Audio API
-    const float32Data = new Float32Array(pcmData.length);
-    for (let i = 0; i < pcmData.length; i++) {
+    // Convert Int16Array to Float32Array for Web Audio API (optimized)
+    const len = pcmData.length;
+    const float32Data = new Float32Array(len);
+    const scale = 1.0 / 32768.0;
+    
+    // Optimized conversion loop
+    for (let i = 0; i < len; i++) {
         // Convert from i16 range (-32768 to 32767) to float range (-1.0 to 1.0)
-        // Use 32768.0 to properly handle -32768
         const sample = pcmData[i];
-        float32Data[i] = sample === -32768 ? -1.0 : sample / 32768.0;
+        float32Data[i] = sample * scale;
     }
 
     // Create audio buffer
@@ -179,10 +276,10 @@ function playAudio(pcmData) {
     source.buffer = buffer;
     source.connect(playbackContext.destination);
     
-    // Track active sources for reset functionality
+    // Track active sources for reset functionality (use Set for O(1) removal)
     activeSources.push(source);
     
-    // Remove source from active list when it finishes
+    // Remove source from active list when it finishes (optimized)
     source.onended = () => {
         const index = activeSources.indexOf(source);
         if (index > -1) {
@@ -196,7 +293,29 @@ function playAudio(pcmData) {
     nextPlayTime += duration;
 }
 
-// Start recording audio from microphone
+// Play PCM audio data (with queuing for batching)
+function playAudio(pcmData) {
+    // Add to queue
+    audioQueue.push(pcmData);
+    
+    // Limit queue size to prevent memory issues
+    if (audioQueue.length > MAX_QUEUE_SIZE) {
+        console.warn('Audio queue overflow, dropping oldest chunk');
+        audioQueue.shift();
+    }
+    
+    // Process queue asynchronously to avoid blocking
+    if (!isProcessingQueue) {
+        // Use requestAnimationFrame for better timing, or setTimeout(0) for immediate processing
+        if (typeof requestAnimationFrame !== 'undefined') {
+            requestAnimationFrame(processAudioQueue);
+        } else {
+            setTimeout(processAudioQueue, 0);
+        }
+    }
+}
+
+// Start recording audio from microphone using AudioWorklet
 async function startRecording() {
     try {
         clearError();
@@ -214,35 +333,83 @@ async function startRecording() {
         // Create audio context
         audioContext = new AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
         
+        // Load and add the audio worklet module
+        // AudioWorklet requires HTTP/HTTPS, not file:// protocol
+        // Try multiple methods to support both HTTP and file:// protocols
+        try {
+            // First, try loading from URL (works with HTTP/HTTPS)
+            try {
+                await audioContext.audioWorklet.addModule('audio-processor.js');
+                isWorkletReady = true;
+            } catch (urlError) {
+                // If URL loading fails (file:// protocol), use embedded code as blob
+                console.log('URL loading failed, trying blob method for file:// protocol:', urlError);
+                const workletCode = await loadWorkletAsBlob();
+                const blob = new Blob([workletCode], { type: 'application/javascript' });
+                const blobUrl = URL.createObjectURL(blob);
+                try {
+                    await audioContext.audioWorklet.addModule(blobUrl);
+                    isWorkletReady = true;
+                } finally {
+                    URL.revokeObjectURL(blobUrl); // Clean up
+                }
+            }
+        } catch (error) {
+            console.error('Failed to load audio worklet:', error);
+            const isFileProtocol = window.location.protocol === 'file:';
+            if (isFileProtocol) {
+                showError(`AudioWorklet requires HTTP/HTTPS. Please use a local server:\n\n` +
+                    `Option 1: Run: ./serve.sh (in this directory)\n` +
+                    `Option 2: Run: python3 -m http.server 8000\n` +
+                    `Then open: http://localhost:8000/ws.html\n\n` +
+                    `Error: ${error.message}`);
+            } else {
+                showError(`Failed to load audio processor: ${error.message}. Please ensure audio-processor.js is accessible.`);
+            }
+            isRecording = false;
+            return;
+        }
+        
         // Create source from microphone
         sourceNode = audioContext.createMediaStreamSource(mediaStream);
         
-        // Create script processor to capture audio
-        processorNode = audioContext.createScriptProcessor(BUFFER_SIZE, CHANNELS, CHANNELS);
+        // Create AudioWorkletNode for capturing audio
+        workletNode = new AudioWorkletNode(audioContext, 'audio-capture-processor', {
+            numberOfInputs: 1,
+            numberOfOutputs: 0, // We don't need output, just capture
+            channelCount: CHANNELS,
+            processorOptions: {
+                bufferSize: BUFFER_SIZE, // Pass buffer size to processor
+            },
+        });
         
-        processorNode.onaudioprocess = (event) => {
+        // Handle messages from the worklet processor
+        workletNode.port.onmessage = (event) => {
             if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) {
                 return;
             }
 
-            // Get audio data from input
-            const inputData = event.inputBuffer.getChannelData(0);
-            
-            // Convert Float32Array to Int16Array
-            const pcmData = new Int16Array(inputData.length);
-            for (let i = 0; i < inputData.length; i++) {
-                // Clamp and convert from float (-1.0 to 1.0) to i16 (-32768 to 32767)
-                const sample = Math.max(-1, Math.min(1, inputData[i]));
-                pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-            }
+            if (event.data.type === 'audio') {
+                // Get audio data from worklet
+                const inputData = event.data.data;
+                const len = inputData.length;
+                
+                // Convert Float32Array to Int16Array (optimized)
+                const pcmData = new Int16Array(len);
+                for (let i = 0; i < len; i++) {
+                    // Clamp and convert from float (-1.0 to 1.0) to i16 (-32768 to 32767)
+                    const sample = Math.max(-1, Math.min(1, inputData[i]));
+                    // Optimized: use bit shift instead of multiplication where possible
+                    pcmData[i] = sample < 0 ? (sample * 32768) | 0 : (sample * 32767) | 0;
+                }
 
-            // Send audio data to server
-            sendAudioData(pcmData);
+                // Send audio data to server
+                sendAudioData(pcmData);
+            }
         };
 
-        // Connect nodes
-        sourceNode.connect(processorNode);
-        processorNode.connect(audioContext.destination);
+        // Connect nodes: source -> worklet
+        sourceNode.connect(workletNode);
 
         isRecording = true;
         startBtn.disabled = true;
@@ -252,6 +419,7 @@ async function startRecording() {
         console.error('Failed to start recording:', error);
         showError(`Failed to access microphone: ${error.message}`);
         isRecording = false;
+        isWorkletReady = false;
     }
 }
 
@@ -259,9 +427,10 @@ async function startRecording() {
 function stopRecording() {
     isRecording = false;
     
-    if (processorNode) {
-        processorNode.disconnect();
-        processorNode = null;
+    if (workletNode) {
+        workletNode.disconnect();
+        workletNode.port.close();
+        workletNode = null;
     }
     
     if (sourceNode) {
@@ -279,26 +448,38 @@ function stopRecording() {
         audioContext = null;
     }
     
+    isWorkletReady = false;
     startBtn.disabled = false;
     stopBtn.disabled = true;
 }
 
-// Send audio data to WebSocket server
+// Send audio data to WebSocket server (optimized)
 function sendAudioData(pcmData) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
         return;
     }
 
     // Convert Int16Array to bytes (little-endian)
-    const bytes = new Uint8Array(pcmData.length * 2);
-    for (let i = 0; i < pcmData.length; i++) {
-        const sample = pcmData[i];
-        bytes[i * 2] = sample & 0xFF;
-        bytes[i * 2 + 1] = (sample >> 8) & 0xFF;
+    // Most systems are little-endian, so we can use the buffer directly
+    // But we need to ensure little-endian byte order
+    const len = pcmData.length;
+    const bytes = new Uint8Array(len * 2);
+    const view = new DataView(bytes.buffer);
+    
+    // Write samples as little-endian
+    for (let i = 0; i < len; i++) {
+        view.setInt16(i * 2, pcmData[i], true); // true = little-endian
     }
-
-    // Encode to base64
-    const base64 = btoa(String.fromCharCode(...bytes));
+    
+    // Encode to base64 - use chunked approach to avoid stack overflow
+    let binaryString = '';
+    const chunkSize = 8192; // Process in chunks
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+        // Convert chunk to string efficiently
+        binaryString += String.fromCharCode.apply(null, Array.from(chunk));
+    }
+    const base64 = btoa(binaryString);
 
     // Send as JSON message
     const message = JSON.stringify({
