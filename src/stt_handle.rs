@@ -13,6 +13,8 @@ pub enum SttHandleError {
     NotConnected,
     #[error("STT audio queue is full")]
     AudioQueueFull,
+    #[error("STT final shutdown")]
+    FinalShutdown,
 }
 
 pub struct SttHandle {
@@ -50,6 +52,11 @@ impl SttHandle {
 
     pub async fn reconnect(&self) -> anyhow::Result<()> {
         info!("STT reconnecting...");
+        if self.is_final_shutdown() {
+            info!("STT final shutdown");
+            return Err(SttHandleError::FinalShutdown.into());
+        }
+
         self.reconnecting.store(true, Ordering::SeqCst);
 
         if let Some(client) = self.client.write().await.take() {
@@ -62,6 +69,12 @@ impl SttHandle {
         self.process_queue().await?;
 
         self.reconnecting.store(false, Ordering::SeqCst);
+
+        info!("STT reconnecting done");
+        if self.is_final_shutdown() {
+            info!("STT final shutdown");
+            return Err(SttHandleError::FinalShutdown.into());
+        }
         Ok(())
     }
 
@@ -121,12 +134,26 @@ impl SttHandle {
 
     pub async fn next_event(&self) -> anyhow::Result<Option<SttEvent>> {
         if let Some(ref client) = *self.client.read().await {
-            match client.next_event().await {
-                Ok(event) => {
-                    *self.last_ping.write().await = Instant::now();
-                    Ok(Some(event))
+            tokio::select! {
+                result = client.next_event() => {
+                    match result {
+                        Ok(event) => {
+                            *self.last_ping.write().await = Instant::now();
+                            Ok(Some(event))
+                        }
+                        Err(e) => Err(e.into()),
+                    }
                 }
-                Err(e) => Err(e.into()),
+                _ = async {
+                    loop {
+                        if self.is_final_shutdown() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                } => {
+                    Err(SttHandleError::FinalShutdown.into())
+                }
             }
         } else {
             Err(SttHandleError::NotConnected.into())
@@ -162,9 +189,19 @@ impl SttHandle {
 
     pub async fn shutdown(&self) {
         if let Some(client) = self.client.write().await.take() {
-            let _ = client.send_eos().await;
             client.shutdown().await;
         }
+    }
+
+    pub async fn sleep(&self, delay_ms: u64) -> anyhow::Result<()> {
+        const ROUND_DELAY_MS: u64 = 100;
+        for _ in 0..delay_ms/ROUND_DELAY_MS {
+            tokio::time::sleep(Duration::from_millis(ROUND_DELAY_MS)).await;
+            if self.is_final_shutdown() {
+                return Err(SttHandleError::FinalShutdown.into());
+            }
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

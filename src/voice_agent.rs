@@ -24,6 +24,7 @@ pub struct VoiceAgent {
     capture: Option<PcmCapture>,
     playback: Option<PcmPlayback>,
     wg: WaitGroup,
+    event_tx: Option<UnboundedSender<VoiceAgentEvent>>,
 }
 
 pub struct Config {
@@ -49,6 +50,7 @@ enum VoiceAgentEvent {
     Error,
     LlmResponseChunk(String),
     LlmResponseDone(String),
+    Shutdown,
 }
 
 impl VoiceAgent {
@@ -62,6 +64,7 @@ impl VoiceAgent {
             capture: None,
             playback: None,
             wg: WaitGroup::new(),
+            event_tx: None,
         }
     }
 
@@ -70,7 +73,6 @@ impl VoiceAgent {
         // Create channels
         let (capture_tx, capture_rx) = unbounded_channel::<Vec<i16>>();
         let (playback_tx, playback_rx) = unbounded_channel::<Vec<i16>>();
-        let (stt_bytes_tx, stt_bytes_rx) = unbounded_channel::<Vec<u8>>();
         let (event_tx, event_rx) = unbounded_channel::<VoiceAgentEvent>();
 
         // Create STT handle
@@ -157,12 +159,11 @@ impl VoiceAgent {
         // Spawn background tasks
         self.spawn_stt_ping_task(Arc::clone(&stt));
         self.spawn_tts_ping_task(Arc::clone(&tts));
-        self.spawn_capture_task(stt_bytes_tx.clone(), capture_rx);
-        self.spawn_stt_sender_task(Arc::clone(&stt), stt_bytes_rx);
-        self.spawn_stt_event_task(Arc::clone(&stt), stt_bytes_tx, event_tx.clone());
+        self.spawn_capture_task(capture_rx, Arc::clone(&stt));
+        self.spawn_stt_event_task(Arc::clone(&stt), event_tx.clone());
         self.spawn_llm_task(Arc::clone(&llm), Arc::clone(&tts), llm_input_rx, event_tx.clone());
         self.spawn_tts_event_task(Arc::clone(&tts), playback_tx, event_tx.clone());
-        self.spawn_main_loop_task(Arc::clone(&stt), Arc::clone(&tts), Arc::clone(&llm), playback_controller, event_rx, llm_input_tx.clone());
+        self.spawn_main_loop_task(Arc::clone(&stt), Arc::clone(&tts), Arc::clone(&llm), playback_controller, event_rx, llm_input_tx);
 
         // Store handles
         self.stt = Some(stt);
@@ -170,6 +171,7 @@ impl VoiceAgent {
         self.llm = Some(llm);
         self.capture = Some(capture);
         self.playback = Some(playback);
+        self.event_tx = Some(event_tx);
 
         info!("voice agent started");
         Ok(())
@@ -182,12 +184,16 @@ impl VoiceAgent {
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
 
-        tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down");
-            }
-            _ = sigint.recv() => {
-                info!("received SIGINT (Ctrl-C), shutting down");
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM, shutting down");
+                    break;
+                }
+                _ = sigint.recv() => {
+                    info!("received SIGINT (Ctrl-C), shutting down");
+                    break;
+                }
             }
         }
 
@@ -196,31 +202,46 @@ impl VoiceAgent {
 
     /// Shutdown the voice agent gracefully
     pub async fn shutdown(&mut self) {
-        // Stop audio capture
+        // Set final shutdown flags first (atomic, immediate signal to event loops)
+        if let Some(ref stt) = self.stt {
+            stt.set_final_shutdown();
+        }
+        if let Some(ref tts) = self.tts {
+            tts.set_final_shutdown();
+        }
+
+        // Stop audio capture (fast, non-blocking)
         if let Some(ref capture) = self.capture {
             info!("stopping audio capture");
             capture.stop();
         }
 
-        // Shutdown STT
         if let Some(ref stt) = self.stt {
             info!("shutting down STT");
-            stt.set_final_shutdown();
             stt.shutdown().await;
         }
 
-        // Shutdown TTS
         if let Some(ref tts) = self.tts {
             info!("shutting down TTS");
-            tts.set_final_shutdown();
             tts.shutdown().await;
         }
 
-        // Stop audio playback
+        // Close channels to signal tasks to stop (after shutdowns are in progress)
+        info!("closing channels");
+        // Stop audio playback (after closing playback_tx)
         if let Some(ref playback) = self.playback {
             info!("stopping audio playback");
             playback.stop();
         }
+
+        // Signal shutdown to all tasks
+        info!("signalling shutdown to all tasks");
+        if let Some(ref event_tx) = self.event_tx {
+            if let Err(_) = event_tx.send(VoiceAgentEvent::Shutdown) {
+                warn!("event channel receiver already closed, shutdown signal not needed");
+            }
+        }
+        self.event_tx.take();
 
         // Wait for all tasks to finish
         info!("waiting for all tasks to finish");
@@ -233,40 +254,40 @@ impl VoiceAgent {
     // Private task spawners
     // ========================================================================
 
+    const STT_PING_INTERVAL_MS: u64 = 3000;
     fn spawn_stt_ping_task(&self, stt: Arc<SttHandle>) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
-            let mut interval = tokio::time::interval(Duration::from_secs(3));
             loop {
-                interval.tick().await;
-                info!("sending STT ping");
+                if let Err(e) = stt.sleep(Self::STT_PING_INTERVAL_MS).await {
+                    warn!("STT ping sleep error: {e}");
+                    break;
+                }
+
+                info!("STT sendingping");
                 if let Err(e) = stt.send_ping().await {
                     warn!("STT ping error: {e}");
-                    if stt.is_final_shutdown() {
-                        info!("STT final shutdown, stopping ping task");
-                        break;
-                    }
                 }
             }
             info!("STT ping task stopped");
         });
     }
 
+    const TTS_PING_INTERVAL_MS: u64 = 3000;
     fn spawn_tts_ping_task(&self, tts: Arc<TtsHandle>) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
-            let mut interval = tokio::time::interval(Duration::from_secs(3));
             loop {
-                interval.tick().await;
-                info!("sending TTS ping");
+                if let Err(e) = tts.sleep(Self::TTS_PING_INTERVAL_MS).await {
+                    warn!("TTS ping sleep error: {e}");
+                    break;
+                }
+
+                info!("TTS sending ping");
                 if let Err(e) = tts.send_ping().await {
                     warn!("TTS ping error: {e}");
-                    if tts.is_final_shutdown() {
-                        info!("TTS final shutdown, stopping ping task");
-                        break;
-                    }
                 }
             }
             info!("TTS ping task stopped");
@@ -275,15 +296,21 @@ impl VoiceAgent {
 
     fn spawn_capture_task(
         &self,
-        stt_bytes_tx: UnboundedSender<Vec<u8>>,
         mut capture_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
+        stt: Arc<SttHandle>
     ) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
             let mut audio_chunks_sent = 0u64;
+            let mut chunks_sent = 0u64;
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut critical_error = false;
             loop {
                 debug!("capture task loop");
+                if critical_error {
+                    break;
+                }
                 // PcmCapture now outputs 24kHz samples directly
                 if let Some(pcm_24k) = capture_rx.recv().await {
                     // Log periodically
@@ -294,44 +321,8 @@ impl VoiceAgent {
 
                     // Convert to bytes (little-endian i16)
                     let bytes: Vec<u8> = pcm_24k.iter().flat_map(|s| s.to_le_bytes()).collect();
-
-                    // Send to STT bytes queue
-                    if let Err(e) = stt_bytes_tx.send(bytes) {
-                        warn!("STT bytes queue send error: {e}");
-                        break;
-                    }
-                } else {
-                    info!("capture task stopping");
-                    break;
-                }
-            }
-            info!("capture task stopped");
-        });
-    }
-
-
-    fn spawn_stt_sender_task(
-        &self,
-        stt: Arc<SttHandle>,
-        mut stt_bytes_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    ) {
-        let wg_guard = self.wg.add();
-        tokio::spawn(async move {
-            let _wg_guard = wg_guard;
-            let mut buffer: Vec<u8> = Vec::new();
-            let mut chunks_sent = 0u64;
-            let mut critical_error = false;
-
-            loop {
-
-                if critical_error {
-                    break;
-                }
-
-                if let Some(bytes) = stt_bytes_rx.recv().await {
                     buffer.extend(bytes);
 
-                    // Send complete 80ms chunks to STT
                     while buffer.len() >= SttHandle::STT_CHUNK_BYTES {
                         let chunk: Vec<u8> = buffer.drain(..SttHandle::STT_CHUNK_BYTES).collect();
                         let b64 = BASE64.encode(&chunk);
@@ -348,25 +339,16 @@ impl VoiceAgent {
                         }
                     }
                 } else {
-                    // Channel closed, flush remaining buffer
-                    if !buffer.is_empty() {
-                        debug!("STT sender: flushing {} remaining bytes", buffer.len());
-                        let b64 = BASE64.encode(&buffer);
-                        if let Err(e) = stt.process(&b64).await {
-                            error!("STT process error on flush: {e}");
-                            break;
-                        }
-                    }
-                    info!("STT sender task stopping");
+                    info!("capture task stopping");
                     break;
                 }
             }
-            info!("STT sender task stopped");
+            info!("capture task stopped");
         });
     }
 
     const VAD_INDEX_TO_CHECK: usize = 2;
-    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, _stt_bytes_tx: UnboundedSender<Vec<u8>>, event_tx: UnboundedSender<VoiceAgentEvent>) {
+    fn spawn_stt_event_task(&self, stt: Arc<SttHandle>, event_tx: UnboundedSender<VoiceAgentEvent>) {
         let wg_guard = self.wg.add();
         tokio::spawn(async move {
             let _wg_guard = wg_guard;
@@ -377,12 +359,16 @@ impl VoiceAgent {
                 debug!("STT event loop");
                 if stt.is_reconnecting() {
                     debug!("STT reconnecting, skipping event loop");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(40)).await;
                     if stt.is_final_shutdown() {
                         info!("STT final shutdown, stopping event loop");
                         break;
                     }
                     continue;
+                }
+                if stt.is_final_shutdown() {
+                    info!("STT final shutdown, stopping event loop");
+                    break;
                 }
 
                 match stt.next_event().await {
@@ -572,12 +558,16 @@ impl VoiceAgent {
                 debug!("TTS event loop");
                 if tts.is_reconnecting() {
                     debug!("TTS reconnecting, skipping event loop");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(40)).await;
                     if tts.is_final_shutdown() {
                         info!("TTS final shutdown, stopping event loop");
                         break;
                     }
                     continue;
+                }
+                if tts.is_final_shutdown() {
+                    info!("TTS final shutdown, stopping event loop");
+                    break;
                 }
 
                 match tts.next_event().await {
@@ -693,61 +683,29 @@ impl VoiceAgent {
                             }
                             VoiceAgentEvent::TtsCloseOrEos => {
                                 info!("TTS close or eos");
-                                if tts.is_final_shutdown() {
-                                    info!("TTS final shutdown");
-                                    break;
-                                }
                                 if let Err(e) = tts.reconnect().await {
                                     error!("TTS reconnect error: {e}");
-                                    break;
-                                }
-                                if tts.is_final_shutdown() {
-                                    info!("TTS final shutdown after reconnect");
                                     break;
                                 }
                             }
                             VoiceAgentEvent::TtsError(message) => {
                                 info!("TTS error: {message}");
-                                if tts.is_final_shutdown() {
-                                    info!("TTS final shutdown");
-                                    break;
-                                }
                                 if let Err(e) = tts.reconnect().await {
                                     error!("TTS reconnect error: {e}");
-                                    break;
-                                }
-                                if tts.is_final_shutdown() {
-                                    info!("TTS final shutdown after reconnect");
                                     break;
                                 }
                             }
                             VoiceAgentEvent::SttCloseOrEos => {
                                 info!("STT close or eos");
-                                if stt.is_final_shutdown() {
-                                    info!("STT final shutdown");
-                                    break;
-                                }
                                 if let Err(e) = stt.reconnect().await {
                                     error!("STT reconnect error: {e}");
-                                    break;
-                                }
-                                if stt.is_final_shutdown() {
-                                    info!("STT final shutdown after reconnect");
                                     break;
                                 }
                             }
                             VoiceAgentEvent::SttError(message) => {
                                 info!("STT error: {message}");
-                                if stt.is_final_shutdown() {
-                                    info!("STT final shutdown");
-                                    break;
-                                }
                                 if let Err(e) = stt.reconnect().await {
                                     error!("STT reconnect error: {e}");
-                                    break;
-                                }
-                                if stt.is_final_shutdown() {
-                                    info!("STT final shutdown after reconnect");
                                     break;
                                 }
                             }
@@ -774,6 +732,10 @@ impl VoiceAgent {
                                     error!("TTS send eos error: {e}");
                                     break;
                                 }
+                            }
+                            VoiceAgentEvent::Shutdown => {
+                                info!("Shutting down voice agent");
+                                break;
                             }
                         }
                     }

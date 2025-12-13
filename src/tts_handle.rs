@@ -14,6 +14,8 @@ pub enum TtsHandleError {
     NotConnected,
     #[error("TTS text queue is full")]
     TextQueueFull,
+    #[error("TTS final shutdown")]
+    FinalShutdown,
 }
 
 pub struct TtsHandle {
@@ -55,6 +57,11 @@ impl TtsHandle {
 
     pub async fn reconnect(&self) -> anyhow::Result<()> {
         info!("TTS reconnecting...");
+        if self.is_final_shutdown() {
+            info!("TTS final shutdown");
+            return Err(TtsHandleError::FinalShutdown.into());
+        }
+
         self.reconnecting.store(true, Ordering::SeqCst);
 
         if let Some(client) = self.client.write().await.take() {
@@ -67,6 +74,12 @@ impl TtsHandle {
         self.process_queue().await?;
 
         self.reconnecting.store(false, Ordering::SeqCst);
+
+        info!("TTS reconnecting done");
+        if self.is_final_shutdown() {
+            info!("TTS final shutdown");
+            return Err(TtsHandleError::FinalShutdown.into());
+        }
         Ok(())
     }
 
@@ -127,12 +140,26 @@ impl TtsHandle {
 
     pub async fn next_event(&self) -> anyhow::Result<Option<TtsEvent>> {
         if let Some(ref client) = *self.client.read().await {
-            match client.next_event().await {
-                Ok(event) => {
-                    *self.last_ping.write().await = Instant::now();
-                    Ok(Some(event))
+            tokio::select! {
+                result = client.next_event() => {
+                    match result {
+                        Ok(event) => {
+                            *self.last_ping.write().await = Instant::now();
+                            Ok(Some(event))
+                        }
+                        Err(e) => Err(e.into()),
+                    }
                 }
-                Err(e) => Err(e.into()),
+                _ = async {
+                    loop {
+                        if self.is_final_shutdown() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {
+                    Err(TtsHandleError::FinalShutdown.into())
+                }
             }
         } else {
             Err(TtsHandleError::NotConnected.into())
@@ -159,7 +186,6 @@ impl TtsHandle {
 
     pub async fn shutdown(&self) {
         if let Some(client) = self.client.write().await.take() {
-            let _ = client.send_eos().await;
             client.shutdown().await;
         }
     }
@@ -175,6 +201,17 @@ impl TtsHandle {
 
     pub fn inflight_requests(&self) -> usize {
         self.inflight_requests.load(Ordering::SeqCst)
+    }
+
+    pub async fn sleep(&self, delay_ms: u64) -> anyhow::Result<()> {
+        const ROUND_DELAY_MS: u64 = 100;
+        for _ in 0..delay_ms/ROUND_DELAY_MS {
+            tokio::time::sleep(Duration::from_millis(ROUND_DELAY_MS)).await;
+            if self.is_final_shutdown() {
+                return Err(TtsHandleError::FinalShutdown.into());
+            }
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
