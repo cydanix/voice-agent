@@ -49,6 +49,12 @@
         button.stop:hover {
             background: #c82333;
         }
+        button.disconnect {
+            background: #6c757d;
+        }
+        button.disconnect:hover {
+            background: #5a6268;
+        }
         .status {
             padding: 15px;
             border-radius: 6px;
@@ -113,6 +119,7 @@
 
         <div class="controls">
             <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn" disabled class="disconnect">Disconnect</button>
             <button id="startBtn" disabled>Start Recording</button>
             <button id="stopBtn" disabled class="stop">Stop Recording</button>
         </div>

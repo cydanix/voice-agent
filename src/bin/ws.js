@@ -19,6 +19,7 @@ const BUFFER_SIZE = 2048;
 
 // DOM elements
 const connectBtn = document.getElementById('connectBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const statusDiv = document.getElementById('status');
@@ -118,6 +119,7 @@ async function connect() {
         ws.onopen = () => {
             updateStatus('Connected', 'connected');
             connectBtn.disabled = true;
+            disconnectBtn.disabled = false;
             startBtn.disabled = false;
             clearError();
             
@@ -137,6 +139,7 @@ async function connect() {
         ws.onclose = () => {
             updateStatus('Disconnected', 'disconnected');
             connectBtn.disabled = false;
+            disconnectBtn.disabled = true;
             startBtn.disabled = true;
             stopBtn.disabled = true;
             stopRecording();
@@ -147,6 +150,8 @@ async function connect() {
         console.error('Connection error:', error);
         showError(`Failed to connect: ${error.message}`);
         updateStatus('Disconnected', 'disconnected');
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
     }
 }
 
@@ -510,8 +515,29 @@ function stopHeartbeat() {
     }
 }
 
+// Disconnect from WebSocket server
+function disconnect() {
+    if (ws) {
+        // Stop recording first
+        stopRecording();
+        stopHeartbeat();
+        
+        // Close WebSocket connection
+        ws.close();
+        ws = null;
+        
+        updateStatus('Disconnected', 'disconnected');
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = true;
+        clearError();
+    }
+}
+
 // Event listeners
 connectBtn.addEventListener('click', connect);
+disconnectBtn.addEventListener('click', disconnect);
 startBtn.addEventListener('click', startRecording);
 stopBtn.addEventListener('click', stopRecording);
 
