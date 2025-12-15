@@ -319,12 +319,12 @@ function playAudioChunk(pcmData) {
 
 // Play PCM audio data (with queuing for batching)
 function playAudio(pcmData) {
-    // Mark that TTS is playing to help echo cancellation awareness
-    isTtsPlaying = true;
     // Don't queue audio if reset is pending
     if (isResetPending) {
         return; // Drop audio until reset is processed
     }
+    // Mark that TTS is playing to help echo cancellation awareness
+    isTtsPlaying = true;
     
     // Add to queue
     audioQueue.push(pcmData);
@@ -592,6 +592,12 @@ function disconnect() {
         // Stop recording first
         stopRecording();
         stopHeartbeat();
+        // Stop any ongoing playback and clear queued audio
+        resetPlayback();
+        if (playbackContext) {
+            playbackContext.close();
+            playbackContext = null;
+        }
         
         // Close WebSocket connection
         ws.close();
