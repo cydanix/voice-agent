@@ -18,7 +18,7 @@ A real-time voice assistant built in Rust that captures audio from your micropho
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │  Microphone │────▶│  STT (ASR)  │────▶│     LLM     │────▶│     TTS     │
-│  (48kHz)    │     │  (24kHz)    │     │  (streaming)│     │  (24kHz)    │
+│  (48kHz)    │     │  (24kHz)    │     │  (streaming)│     │  (48kHz)    │
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
                                                                    │
                                                                    ▼
