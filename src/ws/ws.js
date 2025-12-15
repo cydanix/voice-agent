@@ -17,6 +17,7 @@ const INPUT_SAMPLE_RATE = 24000; // 24kHz sample rate
 const OUTPUT_SAMPLE_RATE = 48000; // 48kHz sample rate
 const CHANNELS = 1; // Mono
 const BUFFER_SIZE = 2048;
+const PLAYBACK_LEAD_TIME = 0.02; // 20ms safety to avoid starting in the past
 
 // DOM elements
 const connectBtn = document.getElementById('connectBtn');
@@ -272,7 +273,11 @@ function processAudioQueue() {
 function playAudioChunk(pcmData) {
     if (!playbackContext) {
         playbackContext = new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
-        nextPlayTime = playbackContext.currentTime;
+        nextPlayTime = playbackContext.currentTime + PLAYBACK_LEAD_TIME;
+    }
+
+    if (playbackContext.state === 'suspended') {
+        playbackContext.resume();
     }
 
     // Convert Int16Array to Float32Array for Web Audio API (optimized)
@@ -313,8 +318,9 @@ function playAudioChunk(pcmData) {
     
     // Calculate duration and schedule next chunk
     const duration = buffer.duration;
-    source.start(nextPlayTime);
-    nextPlayTime += duration;
+    const startTime = Math.max(nextPlayTime, playbackContext.currentTime + PLAYBACK_LEAD_TIME);
+    source.start(startTime);
+    nextPlayTime = startTime + duration;
 }
 
 // Play PCM audio data (with queuing for batching)
