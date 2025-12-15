@@ -1,10 +1,14 @@
+
 use tracing::{debug, error, info};
 use voice_agent::voice_agent::{VoiceAgent, Config};
-use voice_agent::pcm_capture::{PcmCapture};
-use voice_agent::pcm_playback::{PcmPlayback};
+use crate::pcm_capture::{PcmCapture};
+use crate::pcm_playback::{PcmPlayback};
 use voice_agent::messages::{AudioCaptureMessage, AudioPlaybackMessage};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::signal::unix::{signal, SignalKind};
+
+mod pcm_capture;
+mod pcm_playback;
 
 
 #[tokio::main]

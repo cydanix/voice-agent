@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info};
-use crate::messages::AudioCaptureMessage;
+use voice_agent::messages::AudioCaptureMessage;
 
 pub struct PcmCapture {
     stream: cpal::Stream,

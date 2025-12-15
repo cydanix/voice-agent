@@ -29,8 +29,8 @@ once_cell = "1.19"
 
 [[bin]]
 name = "voice-agent"
-path = "src/main.rs"
+path = "src/local/main.rs"
 
 [[bin]]
 name = "voice-agent-ws"
-path = "src/bin/ws.rs"
+path = "src/ws/main.rs"

@@ -126,8 +126,8 @@ RUST_LOG=debug cargo run --release --bin voice-agent-ws
 2. **Serve the client files** using a local HTTP server:
 
    ```bash
-   # Navigate to the bin directory
-   cd src/bin
+   # Navigate to the ws directory
+   cd src/ws
    
    # Option A: Using Python 3
    python3 -m http.server 8000
@@ -224,7 +224,7 @@ Then run the app again and approve the permission prompt.
 ### WebSocket Mode
 
 1. Start the WebSocket server: `cargo run --release --bin voice-agent-ws`
-2. In another terminal, start a local HTTP server in `src/bin/` directory
+2. In another terminal, start a local HTTP server in `src/ws/` directory
 3. Open `http://localhost:8000/ws.html` in your browser
 4. Click "Connect" to establish WebSocket connection
 5. Click "Start Recording" to begin voice interaction
@@ -238,16 +238,19 @@ voice-agent/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   ├── main.rs              # Entry point for direct audio I/O mode
 │   ├── lib.rs               # Library exports
 │   ├── voice_agent.rs       # Main orchestration logic
 │   ├── llm.rs               # LLM client with streaming
+│   ├── messages.rs          # Shared message types
 │   ├── stt_handle.rs        # STT WebSocket wrapper
 │   ├── tts_handle.rs        # TTS WebSocket wrapper
-│   ├── pcm_capture.rs       # Audio input (microphone)
-│   ├── pcm_playback.rs      # Audio output (speakers)
-│   └── bin/
-│       ├── ws.rs            # WebSocket server binary
+│   ├── local/
+│   │   ├── main.rs          # Entry point for direct audio I/O mode
+│   │   ├── pcm_capture.rs   # Audio input (microphone)
+│   │   └── pcm_playback.rs  # Audio output (speakers)
+│   └── ws/
+│       ├── main.rs          # WebSocket server binary
+│       ├── ws.rs            # WebSocket session actor
 │       ├── ws.html          # WebSocket client UI
 │       ├── ws.js            # WebSocket client JavaScript
 │       └── audio-processor.js  # AudioWorklet processor
@@ -257,8 +260,8 @@ voice-agent/
 
 ### Binaries
 
-- **`voice-agent`** (`src/main.rs`): Direct audio I/O mode - uses system microphone and speakers
-- **`voice-agent-ws`** (`src/bin/ws.rs`): WebSocket server mode - accepts connections from web clients
+- **`voice-agent`** (`src/local/main.rs`): Direct audio I/O mode - uses system microphone and speakers
+- **`voice-agent-ws`** (`src/ws/main.rs`): WebSocket server mode - accepts connections from web clients
 
 ### WebSocket Client Files
 

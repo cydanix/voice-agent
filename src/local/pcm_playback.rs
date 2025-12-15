@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, debug, info};
 
-use crate::messages::AudioPlaybackMessage;
+use voice_agent::messages::AudioPlaybackMessage;
 
 pub struct PcmPlayback {
     stream: cpal::Stream,
