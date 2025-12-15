@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use voice_agent::pcm_capture::PcmCaptureMessage;
@@ -50,6 +51,8 @@ struct WebSocketSession {
     capture_tx: UnboundedSender<PcmCaptureMessage>,
     /// Channel to receive playback messages from VoiceAgent
     playback_rx: Option<UnboundedReceiver<PcmPlaybackMessage>>,
+    /// Signal to stop the VoiceAgent when WebSocket ends
+    stop_tx: Option<oneshot::Sender<()>>,
 }
 
 impl Actor for WebSocketSession {
@@ -121,6 +124,7 @@ impl Actor for WebSocketSession {
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
         info!("WebSocket session stopping");
+        self.request_stop();
         Running::Stop
     }
 }
@@ -129,11 +133,13 @@ impl WebSocketSession {
     fn new(
         capture_tx: UnboundedSender<PcmCaptureMessage>,
         playback_rx: UnboundedReceiver<PcmPlaybackMessage>,
+        stop_tx: oneshot::Sender<()>,
     ) -> Self {
         Self {
             hb: Instant::now(),
             capture_tx,
             playback_rx: Some(playback_rx),
+            stop_tx: Some(stop_tx),
         }
     }
 
@@ -143,6 +149,7 @@ impl WebSocketSession {
             // Check client heartbeats
             if Instant::now().duration_since(act.hb) > CLIENT_TIMEOUT {
                 warn!("Client heartbeat timeout, disconnecting");
+                act.request_stop();
                 ctx.stop();
                 return;
             }
@@ -217,6 +224,12 @@ impl WebSocketSession {
         }
     }
 
+    fn request_stop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+    }
+
 }
 
 /// Handler for `ws::Message`
@@ -252,9 +265,13 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
             }
             Ok(ws::Message::Close(reason)) => {
                 info!("WebSocket closing: {:?}", reason);
+                self.request_stop();
                 ctx.stop();
             }
-            _ => ctx.stop(),
+            _ => {
+                self.request_stop();
+                ctx.stop();
+            }
         }
     }
 }
@@ -282,6 +299,7 @@ async fn websocket_handler(
     // Create channels for this connection
     let (capture_tx, capture_rx) = unbounded_channel::<PcmCaptureMessage>();
     let (playback_tx, playback_rx) = unbounded_channel::<PcmPlaybackMessage>();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
     
     // Create VoiceAgent for this connection
     let mut agent = VoiceAgent::new(config);
@@ -291,13 +309,23 @@ async fn websocket_handler(
     }
     
     // Create WebSocket session with channels
-    let session = WebSocketSession::new(capture_tx, playback_rx);
+    let session = WebSocketSession::new(capture_tx, playback_rx, stop_tx);
     
     // Spawn task to run the agent (it will run until shutdown)
     tokio::spawn(async move {
-        if let Err(e) = agent.run().await {
-            error!("VoiceAgent run error: {e}");
+
+        tokio::select! {
+            res = agent.run() => {
+                if let Err(e) = res {
+                    error!("VoiceAgent run error: {e}");
+                }
+            }
+            _ = stop_rx => {
+                info!("WebSocket disconnect detected, stopping VoiceAgent");
+                agent.set_stopping();
+            }
         }
+
         agent.shutdown().await;
     });
     
