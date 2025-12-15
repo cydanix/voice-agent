@@ -518,6 +518,10 @@ impl VoiceAgent {
                     Ok(Some(event)) => {
                         match event {
                             TtsEvent::Audio { audio } => {
+                                if tts.is_discarding() {
+                                    debug!("TTS discard audio event");
+                                    continue;
+                                }
                                 match BASE64.decode(&audio) {
                                     Ok(bytes) => {
                                         let samples: Vec<i16> = bytes
@@ -617,6 +621,8 @@ impl VoiceAgent {
                             }
                             VoiceAgentEvent::UserBreak(text) => {
                                 info!("User break: '{}'", text);
+
+                                tts.set_discarding();
                                 llm.cancel();
                                 if let Err(e) = tts.cancel().await {
                                     error!("Failed to cancel TTS: {e}");

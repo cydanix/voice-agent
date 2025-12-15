@@ -1,6 +1,6 @@
 use rust_gradium::{TtsClient, TtsConfig, TtsEvent};
 use std::sync::{atomic::AtomicBool, Arc, atomic::Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
@@ -21,11 +21,11 @@ pub enum TtsHandleError {
 pub struct TtsHandle {
     client: Arc<RwLock<Option<TtsClient>>>,
     config: TtsConfig,
-    last_ping: Arc<RwLock<Instant>>,
     final_shutdown: AtomicBool,
     text_queue: Mutex<VecDeque<String>>,
     inflight_requests: AtomicUsize,
     reconnecting: AtomicBool,
+    discarding: AtomicBool,
 }
 
 impl TtsHandle {
@@ -35,11 +35,11 @@ impl TtsHandle {
         Self {
             client: Arc::new(RwLock::new(None)),
             config,
-            last_ping: Arc::new(RwLock::new(Instant::now())),
             final_shutdown: AtomicBool::new(false),
             text_queue: Mutex::new(VecDeque::new()),
             inflight_requests: AtomicUsize::new(0),
             reconnecting: AtomicBool::new(false),
+            discarding: AtomicBool::new(false),
         }
     }
 
@@ -51,7 +51,6 @@ impl TtsHandle {
             *client_ptr = Some(client);
             self.inflight_requests.store(0, Ordering::SeqCst);
         }
-        *self.last_ping.write().await = Instant::now();
         Ok(())
     }
 
@@ -67,6 +66,7 @@ impl TtsHandle {
         if let Some(client) = self.client.write().await.take() {
             client.shutdown().await;
         }
+        self.discarding.store(false, Ordering::SeqCst);
         if let Err(e) = self.connect().await {
             error!("TTS reconnect error: {e}");
             return Err(e);
@@ -99,6 +99,7 @@ impl TtsHandle {
             self.reconnect().await?;
         } else {
             info!("TTS: no inflight requests to cancel");
+            self.discarding.store(false, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -144,7 +145,6 @@ impl TtsHandle {
                 result = client.next_event() => {
                     match result {
                         Ok(event) => {
-                            *self.last_ping.write().await = Instant::now();
                             Ok(Some(event))
                         }
                         Err(e) => Err(e.into()),
@@ -214,9 +214,13 @@ impl TtsHandle {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn time_since_last_ping(&self) -> Duration {
-        self.last_ping.read().await.elapsed()
+    pub fn set_discarding(&self) {
+        info!("TTS: setting discarding");
+        self.discarding.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_discarding(&self) -> bool {
+        self.discarding.load(Ordering::SeqCst)
     }
 }
 

@@ -1,6 +1,6 @@
 use rust_gradium::{SttClient, SttConfig, SttEvent};
 use std::sync::{atomic::AtomicBool, Arc, atomic::Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::sync::Mutex;
@@ -20,7 +20,6 @@ pub enum SttHandleError {
 pub struct SttHandle {
     client: Arc<RwLock<Option<SttClient>>>,
     config: SttConfig,
-    last_ping: Arc<RwLock<Instant>>,
     final_shutdown: AtomicBool,
     audio_queue: Mutex<VecDeque<String>>,
     reconnecting: AtomicBool,
@@ -35,7 +34,6 @@ impl SttHandle {
         Self {
             client: Arc::new(RwLock::new(None)),
             config,
-            last_ping: Arc::new(RwLock::new(Instant::now())),
             final_shutdown: AtomicBool::new(false),
             audio_queue: Mutex::new(VecDeque::new()),
             reconnecting: AtomicBool::new(false),
@@ -46,7 +44,6 @@ impl SttHandle {
         let client = SttClient::new(self.config.clone());
         client.start().await?;
         *self.client.write().await = Some(client);
-        *self.last_ping.write().await = Instant::now();
         Ok(())
     }
 
@@ -138,7 +135,6 @@ impl SttHandle {
                 result = client.next_event() => {
                     match result {
                         Ok(event) => {
-                            *self.last_ping.write().await = Instant::now();
                             Ok(Some(event))
                         }
                         Err(e) => Err(e.into()),
@@ -204,9 +200,5 @@ impl SttHandle {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn time_since_last_ping(&self) -> Duration {
-        self.last_ping.read().await.elapsed()
-    }
 }
 
