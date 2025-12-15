@@ -101,20 +101,16 @@ impl Actor for WebSocketSession {
                         }
                         PcmPlaybackMessage::Reset => {
                             debug!("Playback reset requested");
-                            // Send any buffered audio first
-                            if !audio_buffer.is_empty() {
-                                let bytes: Vec<u8> = audio_buffer
-                                    .iter()
-                                    .flat_map(|s| s.to_le_bytes())
-                                    .collect();
-                                let data = BASE64.encode(&bytes);
-                                let msg = serde_json::to_string(&WebSocketResponse::Audio { data })
-                                    .unwrap();
-                                addr.do_send(PlaybackMessage(msg));
-                                audio_buffer.clear();
-                            }
-                            // Send reset message to WebSocket client
+                            // Clear buffered audio - don't send it, as it's from the previous response
+                            // This prevents old audio from playing after reset
+                            audio_buffer.clear();
+                            
+                            // Send reset message FIRST to ensure client processes it before any new audio
                             addr.do_send(PlaybackMessage(reset_msg.clone()));
+                            
+                            // Small delay to ensure reset message is sent before any new audio chunks
+                            // This helps with message ordering over WebSocket
+                            tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                     }
                 }

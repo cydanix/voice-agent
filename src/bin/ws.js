@@ -10,6 +10,7 @@ let playbackContext = null;
 let playbackSource = null;
 let nextPlayTime = 0;
 let activeSources = [];
+let isTtsPlaying = false; // Track TTS playback state for echo cancellation awareness
 
 // Audio configuration
 const INPUT_SAMPLE_RATE = 24000; // 24kHz sample rate
@@ -162,6 +163,10 @@ function handleMessage(data) {
         const message = JSON.parse(data);
         
         if (message.type === 'audio') {
+            // If reset is pending, ignore audio until reset is processed
+            if (isResetPending) {
+                return; // Drop audio that arrived before reset
+            }
             // Decode base64 audio data
             const audioData = base64ToPCM(message.data);
             playAudio(audioData);
@@ -170,8 +175,17 @@ function handleMessage(data) {
         } else if (message.type === 'pong') {
             // Heartbeat response, no action needed
         } else if (message.type === 'reset') {
-            // Reset playback state
+            // Set flag first to block any audio that might arrive during reset processing
+            isResetPending = true;
+            // Reset playback state - this must be processed before any new audio
             resetPlayback();
+            // Clear any queued audio that arrived before reset
+            audioQueue = [];
+            // Small delay to ensure all old audio sources are stopped
+            // Then allow new audio to be processed
+            setTimeout(() => {
+                isResetPending = false;
+            }, 10); // 10ms delay to ensure clean state
         }
     } catch (error) {
         // If not JSON, might be binary or other format
@@ -206,7 +220,7 @@ function base64ToPCM(base64) {
 
 // Reset playback state
 function resetPlayback() {
-    // Clear audio queue
+    // Clear audio queue immediately
     audioQueue = [];
     isProcessingQueue = false;
     
@@ -221,10 +235,10 @@ function resetPlayback() {
     });
     activeSources = [];
     
-    // Reset the next play time to slightly in the future to ensure clean start
-    // Reduced buffer to 20ms for lower latency while still ensuring clean start
+    // Reset the next play time with a longer buffer to ensure all old audio is stopped
+    // Use 50ms buffer to give time for sources to stop and avoid overlap
     if (playbackContext) {
-        nextPlayTime = playbackContext.currentTime + 0.02; // 20ms buffer (reduced from 50ms)
+        nextPlayTime = playbackContext.currentTime + 0.05; // 50ms buffer for clean start
     } else {
         // If context doesn't exist yet, it will be initialized in playAudio
         nextPlayTime = 0;
@@ -234,6 +248,7 @@ function resetPlayback() {
 // Audio playback queue for batching
 let audioQueue = [];
 let isProcessingQueue = false;
+let isResetPending = false; // Flag to ignore audio until reset is processed
 const MAX_QUEUE_SIZE = 10; // Limit queue size to prevent memory issues
 
 // Process audio queue
@@ -290,6 +305,10 @@ function playAudioChunk(pcmData) {
         if (index > -1) {
             activeSources.splice(index, 1);
         }
+        // If this was the last source, mark TTS as not playing
+        if (activeSources.length === 0) {
+            isTtsPlaying = false;
+        }
     };
     
     // Calculate duration and schedule next chunk
@@ -300,6 +319,13 @@ function playAudioChunk(pcmData) {
 
 // Play PCM audio data (with queuing for batching)
 function playAudio(pcmData) {
+    // Mark that TTS is playing to help echo cancellation awareness
+    isTtsPlaying = true;
+    // Don't queue audio if reset is pending
+    if (isResetPending) {
+        return; // Drop audio until reset is processed
+    }
+    
     // Add to queue
     audioQueue.push(pcmData);
     
@@ -318,6 +344,8 @@ function playAudio(pcmData) {
             setTimeout(processAudioQueue, 0);
         }
     }
+    
+    // Note: isTtsPlaying will be reset when the last audio source finishes (in onended callback)
 }
 
 // Start recording audio from microphone using AudioWorklet
@@ -325,14 +353,27 @@ async function startRecording() {
     try {
         clearError();
         
-        // Request microphone access
+        // Request microphone access with enhanced echo cancellation settings
+        // These settings help prevent TTS output from interfering with microphone input
+        const audioConstraints = {
+            channelCount: CHANNELS,
+            sampleRate: INPUT_SAMPLE_RATE,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true, // Helps maintain consistent input levels
+            // Chrome-specific settings for better echo cancellation
+            googEchoCancellation: true,
+            googAutoGainControl: true,
+            googNoiseSuppression: true,
+            googHighpassFilter: true,
+            googTypingNoiseDetection: true,
+            // Additional constraints for better isolation
+            latency: 0.01, // Low latency
+            sampleSize: 16,
+        };
+        
         mediaStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                channelCount: CHANNELS,
-                sampleRate: INPUT_SAMPLE_RATE,
-                echoCancellation: true,
-                noiseSuppression: true,
-            }
+            audio: audioConstraints
         });
 
         // Create audio context
@@ -388,6 +429,12 @@ async function startRecording() {
             },
         });
         
+        // Track audio levels to detect echo cancellation interference
+        let lastAudioLevel = 0;
+        let lowLevelCount = 0;
+        const LOW_LEVEL_THRESHOLD = 0.005; // Threshold for detecting suppressed input
+        const LOW_LEVEL_WARN_COUNT = 10; // Number of consecutive low-level chunks before warning
+        
         // Handle messages from the worklet processor
         workletNode.port.onmessage = (event) => {
             if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) {
@@ -398,6 +445,30 @@ async function startRecording() {
                 // Get audio data from worklet
                 const inputData = event.data.data;
                 const len = inputData.length;
+                
+                // Calculate audio level to detect if input is being suppressed
+                let maxLevel = 0;
+                for (let i = 0; i < len; i++) {
+                    const abs = Math.abs(inputData[i]);
+                    if (abs > maxLevel) {
+                        maxLevel = abs;
+                    }
+                }
+                lastAudioLevel = maxLevel;
+                
+                // Detect if audio level is suspiciously low (possible echo cancellation interference)
+                // Normal speech should have levels above 0.01, silence is near 0
+                // Only check when TTS is NOT playing to avoid false positives
+                if (maxLevel < LOW_LEVEL_THRESHOLD && !isTtsPlaying) {
+                    lowLevelCount++;
+                    // If we see consistently low levels, it might indicate echo cancellation is too aggressive
+                    if (lowLevelCount > LOW_LEVEL_WARN_COUNT) {
+                        console.warn(`Audio input levels are very low (${(maxLevel * 100).toFixed(2)}%) - echo cancellation may be interfering. Consider using headphones or reducing speaker volume.`);
+                        lowLevelCount = 0; // Reset counter
+                    }
+                } else {
+                    lowLevelCount = 0;
+                }
                 
                 // Convert Float32Array to Int16Array (optimized)
                 const pcmData = new Int16Array(len);
