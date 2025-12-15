@@ -3,6 +3,8 @@ use voice_agent::voice_agent::{VoiceAgent, Config};
 use voice_agent::pcm_capture::{PcmCapture, PcmCaptureMessage};
 use voice_agent::pcm_playback::{PcmPlayback, PcmPlaybackMessage};
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::signal::unix::{signal, SignalKind};
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
     let (capture_tx, capture_rx) = unbounded_channel::<PcmCaptureMessage>();
     let (playback_tx, playback_rx) = unbounded_channel::<PcmPlaybackMessage>();
 
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
     let capture = match PcmCapture::new(capture_tx) {
         Ok(c) => c,
         Err(e) => {
@@ -95,20 +100,27 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("voice agent started");
 
-    match agent.run().await {
-        Ok(_) => {
-            info!("run completed successfully");
-            capture.stop();
-            playback.stop();
-            agent.shutdown().await;
-        }
-        Err(e) => {
-            error!("error running voice agent: {e}");
-            capture.stop();
-            playback.stop();
-            agent.shutdown().await;
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
+                agent.set_stopping();
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT (Ctrl-C), shutting down");
+                agent.set_stopping();
+                break;
+            }
+            _ = agent.run() => {
+                info!("voice agent run completed");
+                break;
+            }
         }
     }
+    capture.stop();
+    playback.stop();
+    agent.shutdown().await;
 
     Ok(())
 }

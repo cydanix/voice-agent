@@ -6,8 +6,8 @@ use rust_gradium::wg::WaitGroup;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, error, debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::llm::{LlmClient, LlmConfig, LlmChunk};
 use crate::pcm_capture::PcmCaptureMessage;
@@ -23,6 +23,7 @@ pub struct VoiceAgent {
     llm: Option<Arc<LlmClient>>,
     wg: WaitGroup,
     event_tx: Option<UnboundedSender<VoiceAgentEvent>>,
+    stopping: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -62,6 +63,7 @@ impl VoiceAgent {
             llm: None,
             wg: WaitGroup::new(),
             event_tx: None,
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -131,26 +133,26 @@ impl VoiceAgent {
         Ok(())
     }
 
+    pub fn set_stopping(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
     /// Run the voice agent until shutdown signal is received
     pub async fn run(&self) -> anyhow::Result<()> {
-        info!("running… press Ctrl-C or send SIGTERM to stop");
-
-        let mut sigterm = signal(SignalKind::terminate())?;
-        let mut sigint = signal(SignalKind::interrupt())?;
+        info!("running…");
 
         loop {
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM, shutting down");
-                    break;
-                }
-                _ = sigint.recv() => {
-                    info!("received SIGINT (Ctrl-C), shutting down");
-                    break;
-                }
+            if self.is_stopping() {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
+        info!("stopping…");
         Ok(())
     }
 
