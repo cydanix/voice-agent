@@ -9,8 +9,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-use voice_agent::pcm_capture::PcmCaptureMessage;
-use voice_agent::pcm_playback::PcmPlaybackMessage;
+use voice_agent::messages::{AudioCaptureMessage, AudioPlaybackMessage};
 use voice_agent::voice_agent::{VoiceAgent, Config};
 
 /// How often heartbeat pings are sent
@@ -48,9 +47,9 @@ struct WebSocketSession {
     /// otherwise we drop connection.
     hb: Instant,
     /// Channel to send audio input to VoiceAgent
-    capture_tx: UnboundedSender<PcmCaptureMessage>,
+    capture_tx: UnboundedSender<AudioCaptureMessage>,
     /// Channel to receive playback messages from VoiceAgent
-    playback_rx: Option<UnboundedReceiver<PcmPlaybackMessage>>,
+    playback_rx: Option<UnboundedReceiver<AudioPlaybackMessage>>,
     /// Signal to stop the VoiceAgent when WebSocket ends
     stop_tx: Option<oneshot::Sender<()>>,
 }
@@ -76,7 +75,7 @@ impl Actor for WebSocketSession {
                 
                 while let Some(message) = playback_rx.recv().await {
                     match message {
-                        PcmPlaybackMessage::Play(samples) => {
+                        AudioPlaybackMessage::Play(samples) => {
                             audio_buffer.extend_from_slice(&samples);
                             
                             // Send if buffer is large enough or enough time has passed
@@ -102,7 +101,7 @@ impl Actor for WebSocketSession {
                                 last_send = Instant::now();
                             }
                         }
-                        PcmPlaybackMessage::Reset => {
+                        AudioPlaybackMessage::Reset => {
                             debug!("Playback reset requested");
                             // Clear buffered audio - don't send it, as it's from the previous response
                             // This prevents old audio from playing after reset
@@ -131,8 +130,8 @@ impl Actor for WebSocketSession {
 
 impl WebSocketSession {
     fn new(
-        capture_tx: UnboundedSender<PcmCaptureMessage>,
-        playback_rx: UnboundedReceiver<PcmPlaybackMessage>,
+        capture_tx: UnboundedSender<AudioCaptureMessage>,
+        playback_rx: UnboundedReceiver<AudioPlaybackMessage>,
         stop_tx: oneshot::Sender<()>,
     ) -> Self {
         Self {
@@ -183,7 +182,7 @@ impl WebSocketSession {
                         debug!("Received audio: {} samples", samples.len());
 
                         // Send to VoiceAgent
-                        if let Err(e) = self.capture_tx.send(PcmCaptureMessage::Chunk(samples)) {
+                        if let Err(e) = self.capture_tx.send(AudioCaptureMessage::Chunk(samples)) {
                             error!("Failed to send audio to VoiceAgent: {e}");
                             let error_msg = serde_json::to_string(&WebSocketResponse::Error {
                                 message: "Failed to process audio".to_string(),
@@ -259,7 +258,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
 
                 debug!("Received binary audio: {} samples", samples.len());
 
-                if let Err(e) = self.capture_tx.send(PcmCaptureMessage::Chunk(samples)) {
+                if let Err(e) = self.capture_tx.send(AudioCaptureMessage::Chunk(samples)) {
                     error!("Failed to send audio to VoiceAgent: {e}");
                 }
             }
@@ -297,8 +296,8 @@ async fn websocket_handler(
     let config = config.get_ref().clone();
     
     // Create channels for this connection
-    let (capture_tx, capture_rx) = unbounded_channel::<PcmCaptureMessage>();
-    let (playback_tx, playback_rx) = unbounded_channel::<PcmPlaybackMessage>();
+    let (capture_tx, capture_rx) = unbounded_channel::<AudioCaptureMessage>();
+    let (playback_tx, playback_rx) = unbounded_channel::<AudioPlaybackMessage>();
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     
     // Create VoiceAgent for this connection

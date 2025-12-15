@@ -6,20 +6,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info};
-
-
-pub enum PcmCaptureMessage {
-    Chunk(Vec<i16>),
-}
+use crate::messages::AudioCaptureMessage;
 
 pub struct PcmCapture {
     stream: cpal::Stream,
     stopped: Arc<AtomicBool>,
-    tx: Arc<Mutex<Option<UnboundedSender<PcmCaptureMessage>>>>,
+    tx: Arc<Mutex<Option<UnboundedSender<AudioCaptureMessage>>>>,
 }
 
 impl PcmCapture {
-    pub fn new(tx: UnboundedSender<PcmCaptureMessage>) -> Result<Self> {
+    pub fn new(tx: UnboundedSender<AudioCaptureMessage>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host.default_input_device().ok_or(anyhow::anyhow!("no input device"))?;
         let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
@@ -83,7 +79,7 @@ impl PcmCapture {
         device: &cpal::Device,
         config: &cpal::StreamConfig,
         sample_rate: u32,
-        tx: Arc<Mutex<Option<UnboundedSender<PcmCaptureMessage>>>>,
+        tx: Arc<Mutex<Option<UnboundedSender<AudioCaptureMessage>>>>,
         stopped: Arc<AtomicBool>,
     ) -> Result<cpal::Stream>
     where
@@ -119,7 +115,7 @@ impl PcmCapture {
 
                 if let Ok(guard) = tx.lock() {
                     if let Some(ref sender) = *guard {
-                        let _ = sender.send(PcmCaptureMessage::Chunk(pcm_24k));
+                        let _ = sender.send(AudioCaptureMessage::Chunk(pcm_24k));
                     }
                 }
             },

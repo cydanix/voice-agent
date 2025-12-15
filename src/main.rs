@@ -1,7 +1,8 @@
 use tracing::{debug, error, info};
 use voice_agent::voice_agent::{VoiceAgent, Config};
-use voice_agent::pcm_capture::{PcmCapture, PcmCaptureMessage};
-use voice_agent::pcm_playback::{PcmPlayback, PcmPlaybackMessage};
+use voice_agent::pcm_capture::{PcmCapture};
+use voice_agent::pcm_playback::{PcmPlayback};
+use voice_agent::messages::{AudioCaptureMessage, AudioPlaybackMessage};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -60,8 +61,8 @@ async fn main() -> anyhow::Result<()> {
         llm_system_prompt: llm_system_prompt,
     };
 
-    let (capture_tx, capture_rx) = unbounded_channel::<PcmCaptureMessage>();
-    let (playback_tx, playback_rx) = unbounded_channel::<PcmPlaybackMessage>();
+    let (capture_tx, capture_rx) = unbounded_channel::<AudioCaptureMessage>();
+    let (playback_tx, playback_rx) = unbounded_channel::<AudioPlaybackMessage>();
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;

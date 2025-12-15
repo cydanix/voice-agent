@@ -7,10 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, debug, info};
 
-pub enum PcmPlaybackMessage {
-    Play(Vec<i16>),
-    Reset,
-}
+use crate::messages::AudioPlaybackMessage;
 
 pub struct PcmPlayback {
     stream: cpal::Stream,
@@ -19,7 +16,7 @@ pub struct PcmPlayback {
 }
 
 impl PcmPlayback {
-    pub fn new(mut rx: UnboundedReceiver<PcmPlaybackMessage>) -> Result<Self> {
+    pub fn new(mut rx: UnboundedReceiver<AudioPlaybackMessage>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(anyhow::anyhow!("no output device"))?;
 
@@ -43,13 +40,13 @@ impl PcmPlayback {
                     continue;
                 }
                 match message {
-                    PcmPlaybackMessage::Play(chunk) => {
+                    AudioPlaybackMessage::Play(chunk) => {
                         match queue_clone.lock() {
                             Ok(mut buf) => buf.extend(chunk),
                             Err(e) => error!("failed to lock playback queue: {e}"),
                         }
                     }
-                    PcmPlaybackMessage::Reset => {
+                    AudioPlaybackMessage::Reset => {
                         match queue_clone.lock() {
                             Ok(mut buf) => buf.clear(),
                             Err(e) => error!("failed to lock playback queue: {e}"),
