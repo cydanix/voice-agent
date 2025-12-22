@@ -10,7 +10,8 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use voice_agent::messages::{AudioCaptureMessage, AudioPlaybackMessage};
-use voice_agent::voice_agent::{VoiceAgent, Config};
+use voice_agent::voice_agent::{VoiceAgent, Config, VoiceAgentNoOpEventHandler};
+use std::sync::Arc;
 
 /// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -302,11 +303,12 @@ async fn websocket_handler(
     
     // Create VoiceAgent for this connection
     let mut agent = VoiceAgent::new(config);
-    if let Err(e) = agent.start(capture_rx, playback_tx).await {
+    let event_handler = Arc::new(VoiceAgentNoOpEventHandler);
+    if let Err(e) = agent.start(capture_rx, playback_tx, event_handler).await {
         error!("Failed to start VoiceAgent for WebSocket connection: {e}");
         return Err(actix_web::error::ErrorInternalServerError("Failed to start voice agent"));
     }
-    
+
     // Create WebSocket session with channels
     let session = WebSocketSession::new(capture_tx, playback_rx, stop_tx);
     

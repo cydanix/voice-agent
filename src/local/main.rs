@@ -1,10 +1,11 @@
 
 use tracing::{debug, error, info};
-use voice_agent::voice_agent::{VoiceAgent, Config};
+use voice_agent::voice_agent::{VoiceAgent, Config, VoiceAgentNoOpEventHandler};
 use crate::pcm_capture::{PcmCapture};
 use crate::pcm_playback::{PcmPlayback};
 use voice_agent::messages::{AudioCaptureMessage, AudioPlaybackMessage};
 use tokio::sync::mpsc::unbounded_channel;
+use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 
 mod pcm_capture;
@@ -97,7 +98,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut agent = VoiceAgent::new(config);
-    if let Err(e) = agent.start(capture_rx, playback_tx).await {
+    let event_handler = Arc::new(VoiceAgentNoOpEventHandler);
+    if let Err(e) = agent.start(capture_rx, playback_tx, event_handler).await {
         error!("error starting voice agent: {e}");
         capture.stop();
         playback.stop();

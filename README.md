@@ -231,6 +231,271 @@ Then run the app again and approve the permission prompt.
 6. Speak into your microphone - the agent will respond with audio
 7. Click "Disconnect" when done
 
+## Customizing Behavior with Event Handlers
+
+The voice agent supports custom event handlers that allow you to observe and modify agent behavior. This is useful for:
+- **Logging and monitoring** - Track all events in the voice agent lifecycle
+- **Input preprocessing** - Modify user input before sending to the LLM
+- **Response filtering** - Monitor or filter LLM responses
+- **TTS monitoring** - Observe what text is being spoken
+- **Error handling** - Custom error handling and recovery
+
+### Implementing a Custom Event Handler
+
+Create a struct that implements the `VoiceAgentEventHandler` trait:
+
+```rust
+use voice_agent::voice_agent::{VoiceAgentEventHandler, VoiceAgent};
+use async_trait::async_trait;
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct MyEventHandler {
+    // Add any state you need
+}
+
+#[async_trait]
+impl VoiceAgentEventHandler for MyEventHandler {
+    // Modify user input before sending to LLM
+    async fn on_user_input(&self, input: String) -> String {
+        println!("User said: {}", input);
+        // You can modify the input here
+        // For example, add a prefix or filter certain words
+        format!("[Modified] {}", input)
+    }
+
+    // Observe when user interrupts (e.g., says "stop")
+    async fn on_user_break(&self, text: String) {
+        println!("User interrupted with: {}", text);
+    }
+
+    // Monitor TTS speech output
+    async fn on_tts_speech(&self, text: String) {
+        println!("Speaking: {}", text);
+        // Note: Currently this is observation-only
+        // The original text is still used for TTS processing
+    }
+
+    // Handle TTS errors
+    async fn on_tts_error(&self, error: String) {
+        eprintln!("TTS error: {}", error);
+    }
+
+    // Handle STT errors
+    async fn on_stt_error(&self, error: String) {
+        eprintln!("STT error: {}", error);
+    }
+
+    // Handle TTS connection close or end-of-speech
+    async fn on_tts_close_or_eos(&self) {
+        println!("TTS connection closed or end of speech");
+    }
+
+    // Handle STT connection close or end-of-speech
+    async fn on_stt_close_or_eos(&self) {
+        println!("STT connection closed or end of speech");
+    }
+
+    // Handle general errors
+    async fn on_error(&self) {
+        eprintln!("Voice agent error occurred");
+    }
+
+    // Monitor LLM response chunks (streaming)
+    async fn on_llm_response_chunk(&self, text: String) {
+        println!("LLM chunk: {}", text);
+    }
+
+    // Monitor complete LLM response
+    async fn on_llm_response_done(&self, text: String) {
+        println!("LLM response complete: {}", text);
+    }
+
+    // Handle shutdown
+    async fn on_shutdown(&self) {
+        println!("Voice agent shutting down");
+    }
+}
+
+// Usage:
+let event_handler = Arc::new(MyEventHandler {});
+agent.start(capture_rx, playback_tx, event_handler).await?;
+```
+
+### Event Handler Methods
+
+| Method | Purpose | Can Modify? |
+|--------|---------|-------------|
+| `on_user_input` | Called when user speech is transcribed | ✅ Yes - returns modified input |
+| `on_user_break` | Called when user interrupts (e.g., "stop") | ❌ No - observation only |
+| `on_tts_speech` | Called when text is sent to TTS | ❌ No - observation only |
+| `on_tts_error` | Called on TTS errors | ❌ No - observation only |
+| `on_stt_error` | Called on STT errors | ❌ No - observation only |
+| `on_tts_close_or_eos` | Called when TTS connection closes or ends | ❌ No - observation only |
+| `on_stt_close_or_eos` | Called when STT connection closes or ends | ❌ No - observation only |
+| `on_error` | Called on general errors (takes error message) | ❌ No - observation only |
+| `on_llm_response_chunk` | Called for each streaming LLM chunk | ❌ No - observation only |
+| `on_llm_response_done` | Called when LLM response is complete | ❌ No - observation only |
+| `on_shutdown` | Called during agent shutdown | ❌ No - observation only |
+
+### Example: Input Preprocessing
+
+Modify user input before it's sent to the LLM:
+
+```rust
+async fn on_user_input(&self, input: String) -> String {
+    // Add context or modify input
+    if input.to_lowercase().contains("weather") {
+        format!("What is the weather today? User also said: {}", input)
+    } else {
+        input
+    }
+}
+```
+
+### Example: Logging Handler
+
+Create a comprehensive logging handler:
+
+```rust
+use tracing::{info, error, warn};
+
+struct LoggingEventHandler;
+
+#[async_trait]
+impl VoiceAgentEventHandler for LoggingEventHandler {
+    async fn on_user_input(&self, input: String) -> String {
+        info!("User input: {}", input);
+        input
+    }
+
+    async fn on_llm_response_done(&self, text: String) {
+        info!("LLM response: {}", text);
+    }
+
+    async fn on_tts_speech(&self, text: String) {
+        info!("TTS speaking: {}", text);
+    }
+
+    // ... implement other methods
+}
+```
+
+### Injecting TTS Speech Programmatically
+
+You can programmatically inject text to be spoken by the agent using the `inject_tts_speech` method. This is useful for:
+- **Greetings** - Say hello when the agent starts
+- **Notifications** - Alert the user about events
+- **Custom interactions** - Create your own voice responses outside of the LLM flow
+- **System messages** - Provide status updates or instructions
+
+```rust
+use voice_agent::voice_agent::{VoiceAgent, Config, VoiceAgentNoOpEventHandler};
+use std::sync::Arc;
+
+// After starting the agent
+let mut agent = VoiceAgent::new(config);
+let event_handler = Arc::new(VoiceAgentNoOpEventHandler);
+agent.start(capture_rx, playback_tx, event_handler).await?;
+
+// Inject speech programmatically
+agent.inject_tts_speech("Hello! I'm ready to help.".to_string());
+agent.inject_tts_speech("What would you like to know?".to_string());
+
+// The text will be spoken immediately through TTS
+// This bypasses the LLM and goes directly to TTS processing
+```
+
+**Important Notes:**
+- `inject_tts_speech` is **non-blocking** - it queues the text for TTS processing
+- The text will trigger the `on_tts_speech` event handler callback
+- Multiple calls will queue the text in order
+- The agent must be started (via `start()`) before calling this method
+- This method is thread-safe and can be called from any thread
+
+### Example: Interactive Greeting
+
+```rust
+// Start the agent
+agent.start(capture_rx, playback_tx, event_handler).await?;
+info!("Voice agent started");
+
+// Greet the user immediately
+agent.inject_tts_speech("Hello! I'm your voice assistant. How can I help you today?".to_string());
+
+// Continue with normal operation
+agent.run().await?;
+```
+
+### Injecting Errors from Upper Layers
+
+You can inject errors from upper layers (your application code) using the `inject_error` method. This is useful for:
+- **Application-level errors** - Report errors from your business logic
+- **External service failures** - Notify about failures in external dependencies
+- **Validation errors** - Report validation failures
+- **Graceful shutdown triggers** - Signal that the agent should stop due to an error condition
+
+```rust
+use voice_agent::voice_agent::{VoiceAgent, Config, VoiceAgentNoOpEventHandler};
+use std::sync::Arc;
+
+// After starting the agent
+let mut agent = VoiceAgent::new(config);
+let event_handler = Arc::new(VoiceAgentNoOpEventHandler);
+agent.start(capture_rx, playback_tx, event_handler).await?;
+
+// Inject an error from your application layer
+if some_condition_failed {
+    agent.inject_error("Failed to connect to external service".to_string());
+}
+
+// The error will:
+// 1. Trigger the on_error event handler callback
+// 2. Log the error
+// 3. Stop the agent's main loop gracefully
+```
+
+**Important Notes:**
+- `inject_error` is **non-blocking** - it sends the error event asynchronously
+- The error will trigger the `on_error` event handler callback with the error message
+- **The agent will stop** after processing the error (the main loop breaks)
+- The agent must be started (via `start()`) before calling this method
+- This method is thread-safe and can be called from any thread
+- Use this for fatal errors that require the agent to stop
+
+### Example: Error Handling with Custom Event Handler
+
+```rust
+struct ErrorHandlingEventHandler;
+
+#[async_trait]
+impl VoiceAgentEventHandler for ErrorHandlingEventHandler {
+    // ... other methods ...
+
+    async fn on_error(&self, error_message: String) {
+        eprintln!("Agent error: {}", error_message);
+        // Perform cleanup, notify user, etc.
+        // The agent will stop after this callback completes
+    }
+}
+
+// In your application code
+if external_service_failed {
+    agent.inject_error(format!("External service unavailable: {}", service_name));
+    // Agent will stop gracefully after on_error is called
+}
+```
+
+### No-Op Handler
+
+For basic usage without customization, use `VoiceAgentNoOpEventHandler`:
+
+```rust
+use voice_agent::voice_agent::VoiceAgentNoOpEventHandler;
+
+let event_handler = Arc::new(VoiceAgentNoOpEventHandler);
+```
+
 ## Project Structure
 
 ```
