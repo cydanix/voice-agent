@@ -297,8 +297,8 @@ impl VoiceAgentEventHandler for MyEventHandler {
     }
 
     // Handle general errors
-    async fn on_error(&self) {
-        eprintln!("Voice agent error occurred");
+    async fn on_error(&self, error_message: String) {
+        eprintln!("Voice agent error: {}", error_message);
     }
 
     // Monitor LLM response chunks (streaming)
