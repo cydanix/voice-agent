@@ -42,6 +42,7 @@ pub struct Config {
 enum VoiceAgentEvent {
     UserInput(String),
     UserBreak(String),
+    TtsSpeech(String),
     TtsError(String),
     SttError(String),
     TtsCloseOrEos,
@@ -189,6 +190,14 @@ impl VoiceAgent {
         self.wg.wait().await;
 
         info!("shutdown complete");
+    }
+
+    pub fn inject_tts_speech(&self, text: String) {
+        if let Some(ref event_tx) = self.event_tx {
+            if let Err(e) = event_tx.send(VoiceAgentEvent::TtsSpeech(text)) {
+                warn!("Failed to send TTS text: {e}");
+            }
+        }
     }
 
     // ========================================================================
@@ -704,6 +713,17 @@ impl VoiceAgent {
                                         error!("TTS process error: {e}");
                                         break;
                                     }
+                                }
+                                if let Err(e) = tts.send_eos().await {
+                                    error!("TTS send eos error: {e}");
+                                    break;
+                                }
+                            }
+                            VoiceAgentEvent::TtsSpeech(text) => {
+                                info!("TTS speech: '{}'", text);
+                                if let Err(e) = tts.process(&text).await {
+                                    error!("TTS process error: {e}");
+                                    break;
                                 }
                                 if let Err(e) = tts.send_eos().await {
                                     error!("TTS send eos error: {e}");
