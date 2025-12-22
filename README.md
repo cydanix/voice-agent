@@ -496,6 +496,145 @@ use voice_agent::voice_agent::VoiceAgentNoOpEventHandler;
 let event_handler = Arc::new(VoiceAgentNoOpEventHandler);
 ```
 
+## Managing LLM Conversation History
+
+The voice agent maintains conversation history automatically, but you can also manage it programmatically. This is useful for:
+- **Context management** - Load previous conversations or clear history
+- **System prompt customization** - Change the assistant's behavior dynamically
+- **Multi-session support** - Save and restore conversation state
+- **Custom history management** - Implement your own history persistence
+
+### Getting and Setting History via VoiceAgent
+
+The recommended way to manage history is through the `VoiceAgent` methods:
+
+```rust
+use voice_agent::voice_agent::{VoiceAgent, Config, VoiceAgentNoOpEventHandler};
+use voice_agent::llm::{LlmHistory, Message};
+use std::sync::Arc;
+
+let mut agent = VoiceAgent::new(config);
+let event_handler = Arc::new(VoiceAgentNoOpEventHandler);
+agent.start(capture_rx, playback_tx, event_handler).await?;
+
+// Get current conversation history
+let history: LlmHistory = agent.get_llm_history().await;
+
+// Get messages from history
+let messages = history.get_messages();
+for message in messages {
+    println!("{:?}: {}", message.role, message.content);
+}
+
+// Set a new history (useful for loading saved conversations)
+let mut new_history = LlmHistory::new();
+new_history.set_system_prompt("You are a technical assistant.".to_string());
+new_history.add_message(Message::user("Previous context"));
+agent.set_llm_history(new_history).await;
+
+// Clear history (resets to default system prompt)
+agent.clear_llm_history().await;
+```
+
+### Managing System Prompt via VoiceAgent
+
+The system prompt defines the assistant's behavior and personality. You can get and update it at runtime:
+
+```rust
+// Get current system prompt
+let current_prompt = agent.get_llm_system_prompt().await;
+println!("Current system prompt: {}", current_prompt);
+
+// Update system prompt dynamically
+agent.set_llm_system_prompt("You are a friendly customer service agent.".to_string()).await;
+
+// The next LLM request will use the new system prompt
+```
+
+### Example: Dynamic System Prompt Updates
+
+Change the assistant's behavior based on context:
+
+```rust
+// Start with default prompt
+let mut agent = VoiceAgent::new(config);
+agent.start(capture_rx, playback_tx, event_handler).await?;
+
+// Later, update system prompt based on user preference
+if user_wants_technical_mode {
+    agent.set_llm_system_prompt(
+        "You are a technical expert. Provide detailed technical explanations."
+    ).await;
+} else {
+    agent.set_llm_system_prompt(
+        "You are a friendly assistant. Keep responses simple and conversational."
+    ).await;
+}
+```
+
+### Example: Saving and Restoring Conversations
+
+```rust
+use voice_agent::voice_agent::VoiceAgent;
+use voice_agent::llm::{LlmHistory, Message};
+
+// Save conversation before shutdown
+let history = agent.get_llm_history().await;
+let messages = history.get_messages();
+// Serialize and save to database/file
+save_to_storage(&messages);
+
+// Later, restore conversation
+let saved_messages = load_from_storage();
+let mut restored_history = LlmHistory::new();
+for msg in saved_messages {
+    restored_history.add_message(msg);
+}
+agent.set_llm_history(restored_history).await;
+```
+
+### Direct LlmClient Access (Advanced)
+
+If you have direct access to the `LlmClient` instance, you can use its methods directly:
+
+```rust
+use voice_agent::llm::{LlmClient, LlmConfig, LlmHistory, Message};
+
+// Direct access to LlmClient methods
+let history = llm_client.history().await;
+llm_client.set_history(new_history).await;
+llm_client.set_system_prompt("New prompt".to_string()).await;
+let prompt = llm_client.get_system_prompt().await;
+llm_client.clear_history().await;
+llm_client.add_message(Message::user("Test")).await;
+```
+
+### Available VoiceAgent Methods
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `get_llm_history()` | Get current conversation history | `LlmHistory` |
+| `set_llm_history(history)` | Replace entire conversation history | `()` |
+| `get_llm_system_prompt()` | Get current system prompt | `String` |
+| `set_llm_system_prompt(prompt)` | Update system prompt | `()` |
+| `clear_llm_history()` | Clear all messages, reset to default system prompt | `()` |
+
+### LlmHistory Methods
+
+The `LlmHistory` struct provides additional methods for working with history:
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `get_messages()` | Get all messages as a vector | `Vec<Message>` |
+| `get_system_prompt()` | Get the system prompt string | `String` |
+| `len()` | Get number of messages | `usize` |
+| `get(index)` | Get a message by index | `Option<&Message>` |
+| `add_message(message)` | Add a message to history | `()` |
+| `set_system_prompt(prompt)` | Update system prompt | `()` |
+| `clear()` | Clear all messages, reset to default | `()` |
+
+**Indexing**: You can also access messages by index: `history[0]` returns the first message.
+
 ## Project Structure
 
 ```

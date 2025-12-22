@@ -10,7 +10,7 @@ use tracing::{info, error, debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 
-use crate::llm::{LlmClient, LlmConfig, LlmChunk};
+use crate::llm::{LlmClient, LlmConfig, LlmChunk, LlmHistory};
 use crate::messages::{AudioCaptureMessage, AudioPlaybackMessage};
 use crate::stt_handle::SttHandle;
 use crate::tts_handle::TtsHandle;
@@ -256,6 +256,48 @@ impl VoiceAgent {
             if let Err(e) = event_tx.send(VoiceAgentEvent::Error(error_message)) {
                 warn!("Failed to send error message: {e}");
             }
+        }
+    }
+
+    pub async fn get_llm_history(&self) -> LlmHistory {
+        if let Some(ref llm) = self.llm {
+            llm.history().await
+        } else {
+            warn!("LLM not connected, returning empty history");
+            LlmHistory::new()
+        }.clone()
+    }
+
+    pub async fn set_llm_history(&self, history: LlmHistory) {
+        if let Some(ref llm) = self.llm {
+            llm.set_history(history).await;
+        } else {
+            warn!("LLM not connected, skipping history set");
+        }
+    }
+
+    pub async fn clear_llm_history(&self) {
+        if let Some(ref llm) = self.llm {
+            llm.clear_history().await;
+        } else {
+            warn!("LLM not connected, skipping history clear");
+        }
+    }
+
+    pub async fn set_llm_system_prompt(&self, prompt: String) {
+        if let Some(ref llm) = self.llm {
+            llm.set_system_prompt(prompt).await;
+        } else {
+            warn!("LLM not connected, skipping system prompt set");
+        }
+    }
+
+    pub async fn get_llm_system_prompt(&self) -> String {
+        if let Some(ref llm) = self.llm {
+            llm.get_system_prompt().await
+        } else {
+            warn!("LLM not connected, returning empty system prompt");
+            String::new()
         }
     }
 

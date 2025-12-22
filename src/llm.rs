@@ -196,11 +196,84 @@ impl CancellationToken {
     }
 }
 
+#[derive(Clone)]
+pub struct LlmHistory {
+    messages: Vec<Message>,
+    system_prompt: String,
+}
+
+impl LlmHistory {
+    const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant. Keep responses brief.";
+
+    pub fn new() -> Self {
+        let mut messages = Vec::new();
+        let system_prompt = Self::DEFAULT_SYSTEM_PROMPT.to_string();
+        messages.push(Message::system(system_prompt.clone()));
+        Self { messages, system_prompt }
+    }
+
+    pub fn add_message(&mut self, message: Message) {
+        self.messages.push(message);
+    }
+
+    pub fn get_messages(&self) -> Vec<Message> {
+        self.messages.clone()
+    }
+
+    pub fn get_system_prompt(&self) -> String {
+        self.system_prompt.clone()
+    }
+
+    pub fn set_system_prompt(&mut self, prompt: String) {
+        // Update stored system prompt
+        self.system_prompt = prompt.clone();
+        
+        // Update or insert system message at the beginning
+        if !self.messages.is_empty() {
+            match self.messages[0].role {
+                Role::System => {
+                    // Replace existing system message
+                    self.messages[0] = Message::system(prompt);
+                }
+                _ => {
+                    // Insert system message at the beginning
+                    self.messages.insert(0, Message::system(prompt));
+                }
+            }
+        } else {
+            // No messages yet, just add the system message
+            self.messages.push(Message::system(prompt));
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.system_prompt = Self::DEFAULT_SYSTEM_PROMPT.to_string();
+        self.messages.clear();
+        self.messages.push(Message::system(self.system_prompt.clone()));
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Message> {
+        self.messages.get(index)
+    }
+}
+
+impl std::ops::Index<usize> for LlmHistory {
+    type Output = Message;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.messages[index]
+    }
+}
+
 /// LLM client with conversation history and streaming support
 pub struct LlmClient {
     config: LlmConfig,
     client: Client,
-    history: Mutex<Vec<Message>>,
+    history: Mutex<LlmHistory>,
     cancel_token: CancellationToken,
 }
 
@@ -208,11 +281,11 @@ impl LlmClient {
     /// Create a new LLM client
     pub fn new(config: LlmConfig) -> Self {
         let client = Client::new();
-        let mut history = Vec::new();
+        let mut history = LlmHistory::new();
 
         // Add system prompt to history if configured
         if let Some(ref prompt) = config.system_prompt {
-            history.push(Message::system(prompt.clone()));
+            history.set_system_prompt(prompt.clone());
         }
 
         Self {
@@ -244,33 +317,43 @@ impl LlmClient {
     }
 
     /// Get the current conversation history
-    pub async fn history(&self) -> Vec<Message> {
+    pub async fn history(&self) -> LlmHistory {
         self.history.lock().await.clone()
     }
 
     /// Clear conversation history (keeps system prompt if configured)
     pub async fn clear_history(&self) {
-        let mut history = self.history.lock().await;
-        history.clear();
-        if let Some(ref prompt) = self.config.system_prompt {
-            history.push(Message::system(prompt.clone()));
-        }
+        self.history.lock().await.clear();
+    }
+
+    pub async fn set_history(&self, history: LlmHistory) {
+        *self.history.lock().await = history;
     }
 
     /// Add a message to history
     pub async fn add_message(&self, message: Message) {
-        self.history.lock().await.push(message);
+        self.history.lock().await.add_message(message);
+    }
+
+    pub async fn set_system_prompt(&self, prompt: String) {
+        self.history.lock().await.set_system_prompt(prompt);
+    }
+
+    pub async fn get_system_prompt(&self) -> String {
+        self.history.lock().await.get_system_prompt()
     }
 
     /// Chat with the LLM (non-streaming)
     pub async fn chat(&self, user_message: &str) -> anyhow::Result<String> {
-        // Add user message to history
-        self.add_message(Message::user(user_message)).await;
+        let messages = {
+            let mut history = self.history.lock().await;
+            history.add_message(Message::user(user_message));
+            history.get_messages()
+        };
 
-        let history = self.history.lock().await;
         let request = ChatRequest {
             model: &self.config.model,
-            messages: &history,
+            messages: &messages,
             stream: false,
             temperature: self.config.temperature,
             max_completion_tokens: self.config.max_tokens,
@@ -291,7 +374,6 @@ impl LlmClient {
         }
 
         let chat_response: ChatResponse = response.json().await?;
-        drop(history);
 
         let content = chat_response
             .choices
@@ -401,13 +483,15 @@ impl LlmClient {
             }));
         }
 
-        // Add user message to history
-        self.add_message(Message::user(user_message)).await;
+        let messages = {
+            let mut history = self.history.lock().await;
+            history.add_message(Message::user(user_message));
+            history.get_messages()
+        };
 
-        let history = self.history.lock().await.clone();
         let request = ChatRequest {
             model: &self.config.model,
-            messages: &history,
+            messages: &messages,
             stream: true,
             temperature: self.config.temperature,
             max_completion_tokens: self.config.max_tokens,
@@ -514,13 +598,15 @@ impl LlmClient {
             return Ok((Box::pin(stream), rx));
         }
 
-        // Add user message to history
-        self.add_message(Message::user(user_message)).await;
+        let messages = {
+            let mut history = self.history.lock().await;
+            history.add_message(Message::user(user_message));
+            history.get_messages()
+        };
 
-        let history = self.history.lock().await.clone();
         let request_body = serde_json::json!({
             "model": self.config.model,
-            "messages": history,
+            "messages": messages,
             "stream": true,
             "temperature": self.config.temperature,
             "max_completion_tokens": self.config.max_tokens,
