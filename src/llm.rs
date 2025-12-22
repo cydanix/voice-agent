@@ -5,8 +5,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 use tokio_stream::Stream;
-use tracing::{debug, warn};
+use tracing::{debug, warn, error};
 
 /// OpenAI-compatible API endpoints for different providers
 pub mod endpoints {
@@ -313,6 +314,80 @@ impl LlmClient {
         self.chat_stream_with_token(user_message, self.cancel_token.clone()).await
     }
 
+    /// Send HTTP request with retry logic for rate limiting errors
+    async fn send_request_with_retry(
+        client: &Client,
+        endpoint: &str,
+        api_key: &str,
+        request: &ChatRequest<'_>,
+        cancel_token: &CancellationToken,
+    ) -> anyhow::Result<reqwest::Response> {
+        // Retry with exponential backoff for rate limiting errors
+        let backoff_delays = [
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+            Duration::from_millis(1600),
+        ];
+
+        let mut last_error = None;
+
+        for (attempt, &delay) in backoff_delays.iter().enumerate() {
+            // Check for cancellation before each retry
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("Request cancelled");
+            }
+
+            let request_result = client
+                .post(endpoint)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(request)
+                .send()
+                .await;
+
+            match request_result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp);
+                    }
+
+                    let status_code = status.as_u16();
+                    // Check if it's a rate limiting error (429) or service unavailable (503)
+                    // 503 is sometimes used for rate limiting when the service is overloaded
+                    if status_code == 429 || status_code == 503 {
+                        let error_text = resp.text().await.unwrap_or_default();
+                        last_error = Some(format!("LLM API rate limit error {}: {}", status, error_text));
+                        
+                        if attempt < backoff_delays.len() - 1 {
+                            warn!("Rate limit error {} (attempt {}/{}), retrying after {:?}", 
+                                status_code, attempt + 1, backoff_delays.len(), delay);
+                            sleep(delay).await;
+                            continue;
+                        } else {
+                            error!("Rate limit error {} after {} attempts, giving up", status_code, backoff_delays.len());
+                            anyhow::bail!("{}", last_error.unwrap());
+                        }
+                    } else {
+                        // Non-rate-limit error, don't retry
+                        let error_text = resp.text().await.unwrap_or_default();
+                        anyhow::bail!("LLM API error {}: {}", status, error_text);
+                    }
+                }
+                Err(e) => {
+                    // Network/connection errors - don't retry, fail immediately
+                    // Only retry on HTTP rate limiting status codes
+                    return Err(anyhow::anyhow!("LLM API request error: {}", e));
+                }
+            }
+        }
+
+        anyhow::bail!("Failed to get successful response after {} retries: {}", 
+            backoff_delays.len(), last_error.unwrap_or_else(|| "Unknown error".to_string()))
+    }
+
     /// Chat with streaming response using a custom cancellation token
     pub async fn chat_stream_with_token(
         &self,
@@ -338,19 +413,13 @@ impl LlmClient {
             max_completion_tokens: self.config.max_tokens,
         };
 
-        let response = self.client
-            .post(&self.config.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("LLM API error {}: {}", status, text);
-        }
+        let response = Self::send_request_with_retry(
+            &self.client,
+            &self.config.endpoint,
+            &self.config.api_key,
+            &request,
+            &cancel_token,
+        ).await?;
 
         let byte_stream = response.bytes_stream();
 
