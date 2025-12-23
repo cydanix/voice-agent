@@ -107,8 +107,6 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("voice agent started");
 
-    agent.inject_tts_speech("Hello, how are you?".to_string());
-
     loop {
         tokio::select! {
             _ = sigterm.recv() => {

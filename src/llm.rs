@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -278,9 +278,22 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    /// Create a new LLM client
+    /// Create a new LLM client with keep-alive connection pooling
     pub fn new(config: LlmConfig) -> Self {
-        let client = Client::new();
+        // Configure HTTP client with keep-alive and connection pooling
+        let client = ClientBuilder::new()
+            // Connection pool settings for connection reuse
+            .pool_max_idle_per_host(10) // Maximum idle connections per host
+            .pool_idle_timeout(Duration::from_secs(90)) // Keep idle connections for 90 seconds
+            // TCP keep-alive to maintain connections
+            .tcp_keepalive(Duration::from_secs(30)) // Send TCP keep-alive packets every 30 seconds
+            // HTTP/2 keep-alive settings (if HTTP/2 is used)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .build()
+            .expect("Failed to create HTTP client with keep-alive configuration");
+
         let mut history = LlmHistory::new();
 
         // Add system prompt to history if configured

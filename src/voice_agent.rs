@@ -560,7 +560,7 @@ impl VoiceAgent {
                                             sentence_buffer.push_str(&text);
 
                                             // Send complete sentences to TTS for faster response
-                                            while let Some(pos) = sentence_buffer.find(['.', '!', '?', '\n']) {
+                                            while let Some(pos) = sentence_buffer.find([' ', '\t', '.', '!', '?', '\n']) {
                                                 let to_send = &sentence_buffer[..=pos];
                                                 if !to_send.trim().is_empty() {
                                                     info!("LLM sending to TTS: '{}'", to_send.trim());
