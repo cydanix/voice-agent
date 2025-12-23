@@ -359,19 +359,13 @@ impl LlmClient {
             max_completion_tokens: self.config.max_tokens,
         };
 
-        let response = self.client
-            .post(&self.config.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("LLM API error {}: {}", status, text);
-        }
+        let response = Self::send_request_with_retry(
+            &self.client,
+            &self.config.endpoint,
+            &self.config.api_key,
+            &request,
+            &self.cancel_token,
+        ).await?;
 
         let chat_response: ChatResponse = response.json().await?;
 
@@ -604,27 +598,21 @@ impl LlmClient {
             history.get_messages()
         };
 
-        let request_body = serde_json::json!({
-            "model": self.config.model,
-            "messages": messages,
-            "stream": true,
-            "temperature": self.config.temperature,
-            "max_completion_tokens": self.config.max_tokens,
-        });
+        let request = ChatRequest {
+            model: &self.config.model,
+            messages: &messages,
+            stream: true,
+            temperature: self.config.temperature,
+            max_completion_tokens: self.config.max_tokens,
+        };
 
-        let response = self.client
-            .post(&self.config.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("LLM API error {}: {}", status, text);
-        }
+        let response = Self::send_request_with_retry(
+            &self.client,
+            &self.config.endpoint,
+            &self.config.api_key,
+            &request,
+            &cancel_token,
+        ).await?;
 
         let byte_stream = response.bytes_stream();
 

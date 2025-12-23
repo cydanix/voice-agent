@@ -24,6 +24,7 @@ enum VoiceAgentEvent {
     SttError(String),
     TtsCloseOrEos,
     SttCloseOrEos,
+    LlmError(String),
     Error(String),
     LlmResponseChunk(String),
     LlmResponseDone(String),
@@ -40,6 +41,7 @@ pub trait VoiceAgentEventHandler: Send + Sync {
     async fn on_tts_close_or_eos(&self);
     async fn on_stt_close_or_eos(&self);
     async fn on_error(&self, error_message: String);
+    async fn on_llm_error(&self, error_message: String);
     async fn on_llm_response_chunk(&self, text: String);
     async fn on_llm_response_done(&self, text: String);
     async fn on_shutdown(&self);
@@ -67,6 +69,8 @@ impl VoiceAgentEventHandler for VoiceAgentNoOpEventHandler {
     async fn on_stt_close_or_eos(&self) {}
 
     async fn on_error(&self, _error_message: String) {}
+
+    async fn on_llm_error(&self, _error_message: String) {}
 
     async fn on_llm_response_chunk(&self, _text: String) {}
 
@@ -589,7 +593,7 @@ impl VoiceAgent {
                             }
                             Err(e) => {
                                 error!("LLM chat error: {e}");
-                                if let Err(e) = event_tx.send(VoiceAgentEvent::Error(format!("LLM chat error: {e}"))) {
+                                if let Err(e) = event_tx.send(VoiceAgentEvent::LlmError(format!("LLM chat error: {e}"))) {
                                     warn!("Failed to send to Error event: {e}");
                                 }
                             }
@@ -826,6 +830,24 @@ impl VoiceAgent {
                                         error!("TTS process error: {e}");
                                         break;
                                     }
+                                }
+                                if let Err(e) = tts.send_eos().await {
+                                    error!("TTS send eos error: {e}");
+                                    break;
+                                }
+                            }
+                            VoiceAgentEvent::LlmError(error_message) => {
+                                warn!("Received LlmError event: {error_message}");
+                                event_handler.on_llm_error(error_message).await;
+                                if is_new_llm_response {
+                                    info!("Resetting playback for new LLM response (done)");
+                                    if let Err(e) = playback_tx.send(AudioPlaybackMessage::Reset) {
+                                        error!("Failed to send reset to playback task: {e}");
+                                        break;
+                                    }
+                                    // Small delay to ensure reset is processed
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    is_new_llm_response = false;
                                 }
                                 if let Err(e) = tts.send_eos().await {
                                     error!("TTS send eos error: {e}");
