@@ -438,7 +438,12 @@ impl VoiceAgent {
                                 if vad.len() > Self::VAD_INDEX_TO_CHECK {
                                     inactivity_prob = vad[Self::VAD_INDEX_TO_CHECK].inactivity_prob;
                                 }
-                                info!("inactivity_prob: {inactivity_prob}");
+
+                                if inactivity_prob <= 0.95 {
+                                    info!("STT inactivity_prob: {inactivity_prob}");
+                                } else {
+                                    debug!("STT inactivity_prob: {inactivity_prob}");
+                                }
 
                                 if !pending_text.is_empty() && inactivity_prob > 0.6 && !flushed {
                                     info!("Flushing STT by silence");
