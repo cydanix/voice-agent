@@ -806,9 +806,12 @@ impl VoiceAgent {
                                     tokio::time::sleep(Duration::from_millis(10)).await;
                                     is_new_llm_response = false;
                                 }
-                                if let Err(e) = tts.process(&text).await {
-                                    error!("TTS process error: {e}");
-                                    break;
+                                if !text.is_empty() {
+                                    event_handler.on_tts_speech(text.clone()).await;
+                                    if let Err(e) = tts.process(&text).await {
+                                        error!("TTS process error: {e}");
+                                        break;
+                                    }
                                 }
                             }
                             VoiceAgentEvent::LlmResponseDone(text) => {
@@ -826,6 +829,7 @@ impl VoiceAgent {
                                     is_new_llm_response = false;
                                 }
                                 if !text.is_empty() {
+                                    event_handler.on_tts_speech(text.clone()).await;
                                     if let Err(e) = tts.process(&text).await {
                                         error!("TTS process error: {e}");
                                         break;
