@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tokio_stream::Stream;
-use tracing::{debug, warn, error};
+use tracing::{debug, warn, error, info};
 
 /// OpenAI-compatible API endpoints for different providers
 pub mod endpoints {
@@ -358,6 +359,7 @@ impl LlmClient {
 
     /// Chat with the LLM (non-streaming)
     pub async fn chat(&self, user_message: &str) -> anyhow::Result<String> {
+        let start_time = Instant::now();
         let messages = {
             let mut history = self.history.lock().await;
             history.add_message(Message::user(user_message));
@@ -381,6 +383,9 @@ impl LlmClient {
         ).await?;
 
         let chat_response: ChatResponse = response.json().await?;
+
+        let elapsed_ms = start_time.elapsed().as_millis();
+        info!("Time to first response: {}ms", elapsed_ms);
 
         let content = chat_response
             .choices
@@ -490,6 +495,7 @@ impl LlmClient {
             }));
         }
 
+        let start_time = Instant::now();
         let messages = {
             let mut history = self.history.lock().await;
             history.add_message(Message::user(user_message));
@@ -517,6 +523,7 @@ impl LlmClient {
         // Parse SSE stream
         let stream = async_stream::stream! {
             let mut buffer = String::new();
+            let mut first_chunk_logged = false;
 
             tokio::pin!(byte_stream);
 
@@ -554,6 +561,11 @@ impl LlmClient {
                                             for choice in chunk.choices {
                                                 if let Some(content) = choice.delta.content {
                                                     if !content.is_empty() {
+                                                        if !first_chunk_logged {
+                                                            let elapsed_ms = start_time.elapsed().as_millis();
+                                                            info!("Time to first chunk: {}ms", elapsed_ms);
+                                                            first_chunk_logged = true;
+                                                        }
                                                         yield LlmChunk::Delta(content);
                                                     }
                                                 }
@@ -605,6 +617,7 @@ impl LlmClient {
             return Ok((Box::pin(stream), rx));
         }
 
+        let start_time = Instant::now();
         let messages = {
             let mut history = self.history.lock().await;
             history.add_message(Message::user(user_message));
@@ -633,6 +646,7 @@ impl LlmClient {
             let mut buffer = String::new();
             let mut full_response = String::new();
             let mut tx = Some(tx);
+            let mut first_chunk_logged = false;
 
             tokio::pin!(byte_stream);
 
@@ -678,6 +692,11 @@ impl LlmClient {
                                             for choice in chunk.choices {
                                                 if let Some(content) = choice.delta.content {
                                                     if !content.is_empty() {
+                                                        if !first_chunk_logged {
+                                                            let elapsed_ms = start_time.elapsed().as_millis();
+                                                            info!("Time to first chunk: {}ms", elapsed_ms);
+                                                            first_chunk_logged = true;
+                                                        }
                                                         full_response.push_str(&content);
                                                         yield LlmChunk::Delta(content);
                                                     }
