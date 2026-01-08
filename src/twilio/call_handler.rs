@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use voice_agent::messages::{AudioCaptureMessage, AudioPlaybackMessage};
 use voice_agent::voice_agent::{Config, VoiceAgent, VoiceAgentNoOpEventHandler};
 
-use crate::audio::{pcm48k_to_ulaw8k, AudioResampler};
+use crate::audio::{AudioResampler, TtsDownsampler};
 use crate::twilio::*;
 
 /// Send audio data to Twilio via WebSocket
@@ -176,6 +176,7 @@ pub async fn call_ws(
         let mut interval = actix_web::rt::time::interval(Duration::from_millis(100));
         let mut twilio_frame_counter = 0u64;
         let mut audio_resampler: Option<AudioResampler> = None;
+        let mut tts_downsampler: Option<TtsDownsampler> = None;
         let mut playback_rx = Some(playback_rx);
 
         loop {
@@ -191,16 +192,27 @@ pub async fn call_ws(
                     if let Some(msg) = msg {
                         match msg {
                             AudioPlaybackMessage::Play(samples) => {
-                                // Convert 48kHz PCM to 8kHz µ-law for Twilio
-                                // Note: Gradium TTS outputs at 48kHz
-                                let ulaw_data = pcm48k_to_ulaw8k(&samples);
-                                if let Err(e) = send_media_to_twilio(
-                                    &mut session,
-                                    &stream_sid,
-                                    &ulaw_data,
-                                    &mut twilio_frame_counter,
-                                ).await {
-                                    error!("Error sending media to Twilio: {}", e);
+                                // Convert 48kHz PCM to 8kHz µ-law frames for Twilio
+                                // Uses stateful downsampler to avoid discontinuities
+                                // and chunks output into 20ms (160 byte) frames
+                                if let Some(ref mut downsampler) = tts_downsampler {
+                                    let frames = downsampler.process(&samples);
+                                    for (i, frame) in frames.iter().enumerate() {
+                                        if let Err(e) = send_media_to_twilio(
+                                            &mut session,
+                                            &stream_sid,
+                                            frame,
+                                            &mut twilio_frame_counter,
+                                        ).await {
+                                            error!("Error sending media to Twilio: {}", e);
+                                            break;
+                                        }
+                                        // Small yield between frames to prevent buffer overflow
+                                        // Every 5 frames (~100ms), yield to allow other tasks
+                                        if i > 0 && i % 5 == 0 {
+                                            tokio::task::yield_now().await;
+                                        }
+                                    }
                                 }
                             }
                             AudioPlaybackMessage::Reset => {
@@ -256,13 +268,25 @@ pub async fn call_ws(
                                                     stream_sid, evt.start.call_sid
                                                 );
 
-                                                // Initialize audio resampler (160 = 20ms at 8kHz)
+                                                // Initialize audio resamplers
+                                                // Upsampler for incoming Twilio audio (160 = 20ms at 8kHz)
                                                 match AudioResampler::new(160) {
                                                     Ok(resampler) => {
                                                         audio_resampler = Some(resampler);
                                                     }
                                                     Err(e) => {
                                                         error!("Failed to create audio resampler: {}", e);
+                                                        let _ = session.close(None).await;
+                                                        return;
+                                                    }
+                                                }
+                                                // Downsampler for outgoing TTS audio
+                                                match TtsDownsampler::new() {
+                                                    Ok(downsampler) => {
+                                                        tts_downsampler = Some(downsampler);
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to create TTS downsampler: {}", e);
                                                         let _ = session.close(None).await;
                                                         return;
                                                     }
