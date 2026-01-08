@@ -21,6 +21,8 @@ pub struct CallContext {
     agent: Mutex<VoiceAgent>,
     /// Stream SID from Twilio
     stream_sid: Mutex<String>,
+    /// Call SID from Twilio (for logging)
+    call_sid: Mutex<String>,
     /// Whether the agent has been started
     agent_started: AtomicBool,
     /// Sender for audio capture (Twilio -> VoiceAgent)
@@ -42,6 +44,7 @@ impl CallContext {
         Self {
             agent: Mutex::new(VoiceAgent::new(config)),
             stream_sid: Mutex::new(String::new()),
+            call_sid: Mutex::new(String::new()),
             agent_started: AtomicBool::new(false),
             capture_tx,
             audio_resampler: Mutex::new(None),
@@ -58,6 +61,17 @@ impl CallContext {
     /// Set the stream SID
     pub async fn set_stream_sid(&self, sid: String) {
         *self.stream_sid.lock().await = sid;
+    }
+
+    /// Get the call SID (for logging/debugging)
+    #[allow(dead_code)]
+    pub async fn get_call_sid(&self) -> String {
+        self.call_sid.lock().await.clone()
+    }
+
+    /// Set the call SID
+    pub async fn set_call_sid(&self, sid: String) {
+        *self.call_sid.lock().await = sid;
     }
 
     /// Check if agent is started
@@ -131,6 +145,16 @@ impl CallContext {
         }
     }
 
+    /// Flush any remaining buffered TTS audio
+    pub async fn flush_tts_buffer(&self) -> Option<Vec<u8>> {
+        let mut downsampler_guard = self.tts_downsampler.lock().await;
+        if let Some(ref mut downsampler) = *downsampler_guard {
+            downsampler.flush()
+        } else {
+            None
+        }
+    }
+
     /// Shutdown the agent
     pub async fn shutdown_agent(&self) {
         if self.is_agent_started() {
@@ -142,11 +166,16 @@ impl CallContext {
 }
 
 /// Messages sent to the Twilio sender task
+#[derive(Debug)]
 enum TwilioOutMessage {
     /// Send audio frames to Twilio
     Audio(Vec<Vec<u8>>),
     /// Send clear command to Twilio
     Clear,
+    /// Send pong response (to ping from Twilio)
+    Pong(Vec<u8>),
+    /// Flush remaining TTS buffer and send
+    Flush,
     /// Shutdown the sender task
     Shutdown,
 }
@@ -351,6 +380,7 @@ fn spawn_twilio_sender_task(
     tokio::spawn(async move {
         let mut frame_counter = 0u64;
         let mut ping_interval = tokio::time::interval(TWILIO_PING_INTERVAL);
+        let mut should_exit = false;
 
         loop {
             tokio::select! {
@@ -370,6 +400,7 @@ fn spawn_twilio_sender_task(
                                     &mut frame_counter,
                                 ).await {
                                     error!("Error sending media to Twilio: {}", e);
+                                    should_exit = true;
                                     break;
                                 }
                                 // Yield every 5 frames (~100ms) to prevent blocking
@@ -377,11 +408,33 @@ fn spawn_twilio_sender_task(
                                     tokio::task::yield_now().await;
                                 }
                             }
+                            if should_exit {
+                                break;
+                            }
                         }
                         Some(TwilioOutMessage::Clear) => {
                             let stream_sid = call_context.get_stream_sid().await;
                             if let Err(e) = send_clear_to_twilio(&mut session, &stream_sid).await {
                                 error!("Error sending clear to Twilio: {}", e);
+                            }
+                        }
+                        Some(TwilioOutMessage::Pong(data)) => {
+                            if let Err(e) = session.pong(&data).await {
+                                warn!("Failed to send pong to Twilio: {}", e);
+                            }
+                        }
+                        Some(TwilioOutMessage::Flush) => {
+                            // Flush any remaining TTS audio
+                            if let Some(frame) = call_context.flush_tts_buffer().await {
+                                let stream_sid = call_context.get_stream_sid().await;
+                                if let Err(e) = send_media_to_twilio(
+                                    &mut session,
+                                    &stream_sid,
+                                    &frame,
+                                    &mut frame_counter,
+                                ).await {
+                                    error!("Error sending flush frame to Twilio: {}", e);
+                                }
                             }
                         }
                         Some(TwilioOutMessage::Shutdown) | None => {
@@ -446,6 +499,11 @@ fn spawn_playback_processor_task(
     })
 }
 
+/// Heartbeat check interval
+const HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Heartbeat timeout (10 minutes - Twilio calls can be long)
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Task that handles incoming Twilio WebSocket messages
 async fn run_twilio_receiver_task(
     mut msg_stream: actix_ws::MessageStream,
@@ -456,7 +514,7 @@ async fn run_twilio_receiver_task(
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let mut last_heartbeat = Instant::now();
-    let mut interval = actix_web::rt::time::interval(Duration::from_millis(100));
+    let mut interval = actix_web::rt::time::interval(HEARTBEAT_CHECK_INTERVAL);
 
     // Wrap channels in Option for one-time consumption
     let mut capture_rx = Some(capture_rx);
@@ -467,9 +525,11 @@ async fn run_twilio_receiver_task(
             // Handle incoming WebSocket messages from Twilio
             Some(Ok(msg)) = msg_stream.recv() => {
                 match msg {
-                    Message::Ping(_bytes) => {
+                    Message::Ping(bytes) => {
                         last_heartbeat = Instant::now();
-                        debug!("Received ping from Twilio");
+                        debug!("Received ping from Twilio, sending pong");
+                        // Send pong response through the sender task
+                        let _ = twilio_out_tx.send(TwilioOutMessage::Pong(bytes.to_vec()));
                     }
                     Message::Pong(_) => {
                         last_heartbeat = Instant::now();
@@ -505,8 +565,8 @@ async fn run_twilio_receiver_task(
                     break;
                 }
 
-                // Check heartbeat timeout (10 minutes)
-                if Instant::now().duration_since(last_heartbeat) > Duration::from_secs(600) {
+                // Check heartbeat timeout
+                if Instant::now().duration_since(last_heartbeat) > HEARTBEAT_TIMEOUT {
                     warn!("Client timeout, closing connection");
                     break;
                 }
@@ -514,6 +574,8 @@ async fn run_twilio_receiver_task(
         }
     }
 
+    // Flush any remaining TTS buffer before shutdown
+    let _ = twilio_out_tx.send(TwilioOutMessage::Flush);
     // Signal shutdown to sender
     let _ = twilio_out_tx.send(TwilioOutMessage::Shutdown);
     info!("Twilio receiver task stopped");
@@ -550,6 +612,7 @@ async fn handle_twilio_text_message(
                 "start" => {
                     if let Ok(evt) = serde_json::from_str::<TwilioStartEvent>(text) {
                         call_context.set_stream_sid(evt.stream_sid.clone()).await;
+                        call_context.set_call_sid(evt.start.call_sid.clone()).await;
                         info!(
                             "Twilio stream started: stream_sid={}, call_sid={}",
                             evt.stream_sid, evt.start.call_sid
@@ -567,7 +630,7 @@ async fn handle_twilio_text_message(
                                 error!("Failed to start VoiceAgent: {}", e);
                                 return false;
                             }
-                            info!("VoiceAgent started successfully");
+                            info!("VoiceAgent started successfully for call_sid={}", evt.start.call_sid);
                         }
                     }
                 }

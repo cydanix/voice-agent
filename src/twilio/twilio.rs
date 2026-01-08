@@ -1,13 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// TwilioResponse represents the response to send back to Twilio
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TwilioResponse {
-    pub event: String,
-}
-
-// TwilioGenericEvent represents a generic event with dynamic fields
+/// Generic Twilio event with dynamic fields (for initial parsing)
 pub type TwilioGenericEvent = HashMap<String, serde_json::Value>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,8 +114,10 @@ pub struct TwilioMediaMessagePayload {
     pub payload: String,
 }
 
+/// Message to send a mark event to Twilio (for tracking audio playback)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct TwilioMarkMessage {
     pub event: String,
     pub stream_sid: String,
@@ -129,6 +125,7 @@ pub struct TwilioMarkMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TwilioMarkMessagePayload {
     pub name: String,
 }

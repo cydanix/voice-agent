@@ -2,6 +2,7 @@ use audio_codec_algorithms::{decode_ulaw, encode_ulaw};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
+use tracing::error;
 
 /// Quality preset used for both up/down sampling.
 fn sinc_params() -> SincInterpolationParameters {
@@ -61,7 +62,7 @@ impl AudioResampler {
         let out_f32 = match self.upsampler.process(&[input_f32], None) {
             Ok(mut out) => out.remove(0),
             Err(e) => {
-                eprintln!("Resample error: {}", e);
+                error!("Upsample error (8kHz -> 24kHz): {}", e);
                 return Vec::new();
             }
         };
@@ -125,7 +126,7 @@ impl TtsDownsampler {
         let out_f32 = match self.downsampler.process(&[input_f32], None) {
             Ok(mut out) => out.remove(0),
             Err(e) => {
-                eprintln!("Downsample error: {}", e);
+                error!("Downsample error (48kHz -> 8kHz): {}", e);
                 return Vec::new();
             }
         };
@@ -165,6 +166,7 @@ impl TtsDownsampler {
 
 /// Simple one-shot conversion for small chunks (legacy compatibility).
 /// Prefer TtsDownsampler for streaming to avoid discontinuities.
+#[allow(dead_code)]
 pub fn pcm48k_to_ulaw8k(pcm48_chunk: &[i16]) -> Vec<u8> {
     if pcm48_chunk.is_empty() {
         return Vec::new();
