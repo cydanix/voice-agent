@@ -2,7 +2,6 @@ use actix_web::{web, Error, HttpRequest, HttpResponse};
 use actix_ws::Message;
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::StreamExt;
-use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::unbounded_channel;
@@ -12,20 +11,8 @@ use tracing::{debug, error, info, warn};
 use voice_agent::messages::{AudioCaptureMessage, AudioPlaybackMessage};
 use voice_agent::voice_agent::{Config, VoiceAgent, VoiceAgentNoOpEventHandler};
 
-use crate::audio::{pcm24k_to_ulaw8k, AudioResampler};
+use crate::audio::{pcm48k_to_ulaw8k, AudioResampler};
 use crate::twilio::*;
-
-#[derive(Debug, Deserialize)]
-pub struct TwilioWebhookForm {
-    #[serde(rename = "CallSid")]
-    pub call_sid: Option<String>,
-    #[serde(rename = "From")]
-    pub from: Option<String>,
-    #[serde(rename = "To")]
-    pub to: Option<String>,
-    #[serde(rename = "CallStatus")]
-    pub call_status: Option<String>,
-}
 
 /// Send audio data to Twilio via WebSocket
 async fn send_media_to_twilio(
@@ -204,8 +191,9 @@ pub async fn call_ws(
                     if let Some(msg) = msg {
                         match msg {
                             AudioPlaybackMessage::Play(samples) => {
-                                // Convert 24kHz PCM to 8kHz µ-law for Twilio
-                                let ulaw_data = pcm24k_to_ulaw8k(&samples);
+                                // Convert 48kHz PCM to 8kHz µ-law for Twilio
+                                // Note: Gradium TTS outputs at 48kHz
+                                let ulaw_data = pcm48k_to_ulaw8k(&samples);
                                 if let Err(e) = send_media_to_twilio(
                                     &mut session,
                                     &stream_sid,

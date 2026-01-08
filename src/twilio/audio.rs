@@ -74,21 +74,22 @@ impl AudioResampler {
     }
 }
 
-/// Convert a chunk of 24 kHz linear PCM (i16) -> 8 kHz µ-law bytes.
-/// Downsample 24k -> 8k and then encode µ-law.
-pub fn pcm24k_to_ulaw8k(pcm24_chunk: &[i16]) -> Vec<u8> {
-    if pcm24_chunk.is_empty() {
+/// Convert a chunk of 48 kHz linear PCM (i16) -> 8 kHz µ-law bytes.
+/// Downsample 48k -> 8k and then encode µ-law.
+/// Note: Gradium TTS outputs at 48kHz, not 24kHz!
+pub fn pcm48k_to_ulaw8k(pcm48_chunk: &[i16]) -> Vec<u8> {
+    if pcm48_chunk.is_empty() {
         return Vec::new();
     }
 
     // 1) i16 -> f32 [-1,1]
-    let input_f32: Vec<f32> = pcm24_chunk
+    let input_f32: Vec<f32> = pcm48_chunk
         .iter()
         .map(|&s| s as f32 / i16::MAX as f32)
         .collect();
 
-    // 2) 24k -> 8k
-    let ratio = 8000.0 / 24000.0;
+    // 2) 48k -> 8k (6:1 ratio)
+    let ratio = 8000.0 / 48000.0;
     let params = sinc_params();
     let chunk_size = input_f32.len().max(1);
     let max_rel = 1.0; // fixed ratio
