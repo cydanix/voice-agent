@@ -501,8 +501,9 @@ fn spawn_playback_processor_task(
 
 /// Heartbeat check interval
 const HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-/// Heartbeat timeout (10 minutes - Twilio calls can be long)
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Heartbeat timeout - if no ping/pong for this duration, consider connection dead.
+/// Set to 10x ping interval (30 seconds) to handle brief network hiccups.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Task that handles incoming Twilio WebSocket messages
 async fn run_twilio_receiver_task(
