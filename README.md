@@ -104,6 +104,77 @@ RUST_LOG=debug cargo run --release --bin voice-agent
 
 Runs as a WebSocket server that can be accessed from a browser:
 
+### Option 3: Twilio Voice Integration
+
+Runs as an HTTP/WebSocket server for handling Twilio incoming calls:
+
+```bash
+# Set required environment variables
+export GRADIUM_API_KEY=your_gradium_key
+export OPENAI_API_KEY=your_openai_key
+
+# Optional: Set custom bind address (default: 127.0.0.1:8080)
+export BIND_ADDR=0.0.0.0:8080
+
+# Run the Twilio server
+cargo run --release --bin voice-agent-twilio
+
+# Or with debug logging
+RUST_LOG=debug cargo run --release --bin voice-agent-twilio
+```
+
+#### Twilio Configuration
+
+1. **Set up a Twilio phone number** in your [Twilio Console](https://console.twilio.com/)
+
+2. **Configure the webhook URL** for incoming calls:
+   - Go to your phone number settings
+   - Set "A Call Comes In" webhook to: `https://your-server.com/call` (HTTP POST)
+   - Ensure your server is accessible via HTTPS (Twilio requires SSL)
+
+3. **How it works**:
+   - When a call comes in, Twilio sends a webhook to `/call`
+   - The server responds with TwiML that initiates a WebSocket media stream
+   - Audio is streamed bidirectionally: Twilio sends µ-law 8kHz audio, the server responds with the same format
+   - The voice agent transcribes speech, processes through LLM, and speaks the response
+
+4. **Exposing your local server** (for development):
+   ```bash
+   # Using ngrok
+   ngrok http 8080
+   
+   # Then use the ngrok HTTPS URL in your Twilio webhook configuration
+   ```
+
+#### Twilio Audio Pipeline
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Twilio    │────▶│  µ-law 8kHz │────▶│  PCM 24kHz  │────▶│  STT (ASR)  │
+│  (inbound)  │     │   decode    │     │  upsample   │     │             │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+                                                                   │
+                                                                   ▼
+                                                            ┌─────────────┐
+                                                            │     LLM     │
+                                                            │  (streaming)│
+                                                            └─────────────┘
+                                                                   │
+                                                                   ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Twilio    │◀────│  µ-law 8kHz │◀────│  PCM 8kHz   │◀────│     TTS     │
+│  (outbound) │     │   encode    │     │  downsample │     │  (48kHz)    │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+#### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/call` | POST | Twilio webhook for incoming calls (returns TwiML) |
+| `/call` | WebSocket | Media stream for audio exchange |
+| `/health` | GET | Health check endpoint |
+
 ```bash
 # Set required environment variables
 export GRADIUM_API_KEY=your_gradium_key
@@ -230,6 +301,15 @@ Then run the app again and approve the permission prompt.
 5. Click "Start Recording" to begin voice interaction
 6. Speak into your microphone - the agent will respond with audio
 7. Click "Disconnect" when done
+
+### Twilio Mode
+
+1. Start the Twilio server: `cargo run --release --bin voice-agent-twilio`
+2. Expose the server via HTTPS (e.g., using ngrok: `ngrok http 8080`)
+3. Configure your Twilio phone number webhook to point to `https://your-server.com/call`
+4. Call your Twilio phone number
+5. The agent will greet you and respond to your voice commands
+6. Hang up to end the call
 
 ## Customizing Behavior with Event Handlers
 
@@ -652,12 +732,17 @@ voice-agent/
 │   │   ├── main.rs          # Entry point for direct audio I/O mode
 │   │   ├── pcm_capture.rs   # Audio input (microphone)
 │   │   └── pcm_playback.rs  # Audio output (speakers)
-│   └── ws/
-│       ├── main.rs          # WebSocket server binary
-│       ├── ws.rs            # WebSocket session actor
-│       ├── ws.html          # WebSocket client UI
-│       ├── ws.js            # WebSocket client JavaScript
-│       └── audio-processor.js  # AudioWorklet processor
+│   ├── ws/
+│   │   ├── main.rs          # WebSocket server binary
+│   │   ├── ws.rs            # WebSocket session actor
+│   │   ├── ws.html          # WebSocket client UI
+│   │   ├── ws.js            # WebSocket client JavaScript
+│   │   └── audio-processor.js  # AudioWorklet processor
+│   └── twilio/
+│       ├── main.rs          # Twilio server binary
+│       ├── call_handler.rs  # WebSocket/webhook handler for calls
+│       ├── twilio.rs        # Twilio message types
+│       └── audio.rs         # Audio conversion (µ-law, resampling)
 └── external/
     └── rust-gradium/        # Gradium API client library
 ```
@@ -666,6 +751,7 @@ voice-agent/
 
 - **`voice-agent`** (`src/local/main.rs`): Direct audio I/O mode - uses system microphone and speakers
 - **`voice-agent-ws`** (`src/ws/main.rs`): WebSocket server mode - accepts connections from web clients
+- **`voice-agent-twilio`** (`src/twilio/main.rs`): Twilio integration mode - handles incoming phone calls via Twilio
 
 ### WebSocket Client Files
 
@@ -681,6 +767,15 @@ voice-agent/
 - **Output (Speaker)**: 48kHz, mono, 16-bit PCM
 - **STT Processing**: 24kHz (resampled from device rate if needed)
 - **TTS Output**: 48kHz (from Gradium API)
+
+### Twilio Audio Specifications
+
+- **Twilio Input**: 8kHz, mono, µ-law encoded (20ms frames, 160 bytes)
+- **Twilio Output**: 8kHz, mono, µ-law encoded (20ms frames, 160 bytes)
+- **Audio Conversion**: 
+  - Inbound: µ-law 8kHz → PCM 24kHz (for STT)
+  - Outbound: PCM 48kHz (TTS) → PCM 8kHz → µ-law 8kHz
+- **Resampling**: High-quality sinc interpolation via `rubato` crate
 
 ### WebSocket Server
 
@@ -714,6 +809,28 @@ voice-agent/
 - Ensure WebSocket server is running (`voice-agent-ws`)
 - Verify `BIND_ADDR` matches the URL in the client
 - Check firewall settings
+
+### Twilio Integration Issues
+
+**Twilio webhook fails:**
+- Ensure your server is accessible via HTTPS (use ngrok for local development)
+- Verify the webhook URL is set to `/call` (e.g., `https://your-server.com/call`)
+- Check Twilio console logs for detailed error messages
+
+**No audio or garbled audio:**
+- Verify environment variables are set correctly (`GRADIUM_API_KEY`, `OPENAI_API_KEY`)
+- Check server logs for audio conversion errors
+- Ensure the WebSocket connection is established (look for "Twilio stream started" in logs)
+
+**Call drops immediately:**
+- Check that the TwiML response is valid (look for "Responding with TwiML" in logs)
+- Verify your Twilio account has sufficient balance
+- Check for errors in the Twilio console debugger
+
+**High latency or delayed responses:**
+- Consider using a server closer to your users
+- Check LLM response times in logs (look for "time_to_first_chunk_ms")
+- Ensure STT/TTS endpoints are responsive
 
 ## License
 
