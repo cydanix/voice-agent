@@ -118,6 +118,10 @@ impl CallContext {
         Ok(())
     }
 
+    /// Input audio boost factor to compensate for iPhone AGC suppression
+    /// Higher values = louder input = better STT recognition of quiet audio
+    const INPUT_BOOST_FACTOR: f32 = 2.0;
+
     /// Process incoming Twilio media (convert and forward to VoiceAgent)
     pub async fn process_incoming_media(&self, ulaw_bytes: &[u8]) {
         if !self.is_agent_started() {
@@ -128,18 +132,37 @@ impl CallContext {
         if let Some(ref mut resampler) = *resampler_guard {
             let pcm_samples = resampler.ulaw8k_to_pcm24k(ulaw_bytes);
             if !pcm_samples.is_empty() {
-                if let Err(e) = self.capture_tx.send(AudioCaptureMessage::Chunk(pcm_samples)) {
+                // Boost audio to compensate for iPhone AGC suppression
+                let boosted_samples: Vec<i16> = pcm_samples
+                    .iter()
+                    .map(|&s| {
+                        let boosted = (s as f32) * Self::INPUT_BOOST_FACTOR;
+                        boosted.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+                    })
+                    .collect();
+
+                if let Err(e) = self.capture_tx.send(AudioCaptureMessage::Chunk(boosted_samples)) {
                     error!("Failed to send audio to VoiceAgent: {}", e);
                 }
             }
         }
     }
 
+    /// TTS volume reduction factor (0.0-1.0) to reduce iPhone AGC suppression
+    /// Lower values = quieter TTS = less microphone suppression on caller's phone
+    const TTS_VOLUME_FACTOR: f32 = 0.5;
+
     /// Process outgoing audio (convert TTS output to Twilio frames)
     pub async fn process_outgoing_audio(&self, samples: &[i16]) -> Vec<Vec<u8>> {
+        // Reduce TTS volume to minimize iPhone AGC suppression
+        let reduced_samples: Vec<i16> = samples
+            .iter()
+            .map(|&s| ((s as f32) * Self::TTS_VOLUME_FACTOR) as i16)
+            .collect();
+
         let mut downsampler_guard = self.tts_downsampler.lock().await;
         if let Some(ref mut downsampler) = *downsampler_guard {
-            downsampler.process(samples)
+            downsampler.process(&reduced_samples)
         } else {
             Vec::new()
         }

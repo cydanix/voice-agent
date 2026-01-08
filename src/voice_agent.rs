@@ -372,10 +372,12 @@ impl VoiceAgent {
                         AudioCaptureMessage::Chunk(pcm_24k) => pcm_24k,
                     };
 
-                    // Log periodically
+                    // Log periodically with audio level
                     audio_chunks_sent += 1;
-                    if audio_chunks_sent % 100 == 1 {
-                        info!("audio capture: chunk #{}, {} samples", audio_chunks_sent, pcm_24k.len());
+                    if audio_chunks_sent % 10 == 1 {
+                        let max_level = pcm_24k.iter().map(|s| s.abs()).max().unwrap_or(0);
+                        let level_percent = (max_level as f32 / i16::MAX as f32) * 100.0;
+                        info!("audio capture: chunk #{}, {} samples, level: {:.1}%", audio_chunks_sent, pcm_24k.len(), level_percent);
                     }
 
                     // Convert to bytes (little-endian i16)
@@ -387,7 +389,7 @@ impl VoiceAgent {
                         let b64 = BASE64.encode(&chunk);
 
                         chunks_sent += 1;
-                        if chunks_sent % 100 == 1 {
+                        if chunks_sent % 10 == 1 {
                             info!("STT sender: chunk #{}, {} bytes", chunks_sent, chunk.len());
                         }
 

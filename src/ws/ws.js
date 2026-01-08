@@ -359,20 +359,20 @@ async function startRecording() {
     try {
         clearError();
         
-        // Request microphone access with enhanced echo cancellation settings
-        // These settings help prevent TTS output from interfering with microphone input
+        // Request microphone access with echo cancellation but WITHOUT auto gain control
+        // AGC causes level drops after TTS playback - it reduces gain thinking TTS is background noise
         const audioConstraints = {
             channelCount: CHANNELS,
             sampleRate: INPUT_SAMPLE_RATE,
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true, // Helps maintain consistent input levels
-            // Chrome-specific settings for better echo cancellation
+            autoGainControl: false, // DISABLED - causes mic suppression after TTS
+            // Chrome-specific settings
             googEchoCancellation: true,
-            googAutoGainControl: true,
+            googAutoGainControl: false, // DISABLED
             googNoiseSuppression: true,
             googHighpassFilter: true,
-            googTypingNoiseDetection: true,
+            googTypingNoiseDetection: false, // Disabled - can interfere
             // Additional constraints for better isolation
             latency: 0.01, // Low latency
             sampleSize: 16,
